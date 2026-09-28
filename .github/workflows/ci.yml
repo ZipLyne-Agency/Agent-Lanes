@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit suites and installer smoke test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install extension build tools
+        run: npm --prefix extension ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm --prefix extension run typecheck
+
+      - name: Extension suites (relay, stage, guard, lanes, agent display)
+        run: bash tests/test-extension.sh
+
+      - name: MCP launcher attestation
+        run: bash tests/test-browser-mcp-server.sh
+
+      - name: Native bridge, extension installer, Chrome checks
+        run: /usr/bin/python3 -m unittest tests/test_native_bridge.py tests/test_install_extension.py tests/test_chrome_background_safe.py
+
+      - name: Compile the display helper
+        run: xcrun clang -fobjc-arc -O2 -Wall -Werror -framework AppKit -framework CoreGraphics -o /tmp/agent-lane-display agent-display/agent-lane-display.m
+
+      - name: Install and uninstall into a throwaway home
+        env:
+          AGENT_LANES_SKIP_LAUNCHD: "1"
+        run: |
+          smoke_home="$(mktemp -d)"
+          HOME="$smoke_home" scripts/install.sh
+          test -x "$smoke_home/.local/bin/browser-mcp-server"
+          test -x "$smoke_home/.local/bin/agent-lane-display"
+          test -f "$smoke_home/.local/share/agent-lanes/extension/manifest.json"
+          test -f "$smoke_home/Library/Application Support/Google/Chrome/NativeMessagingHosts/agency.ziplyne.agent_lanes.json"
+          test "$(stat -f %Lp "$smoke_home/.config/agent-lanes/token")" = 600
+          codesign --verify --deep --strict "$smoke_home/Applications/Google Chrome (Agent Safe).app"
+          HOME="$smoke_home" scripts/uninstall.sh --purge
+          test ! -e "$smoke_home/.local/bin/browser-mcp-server"
+          test ! -e "$smoke_home/.local/share/agent-lanes"

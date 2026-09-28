@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src/ui",
+    "types": ["chrome", "vite/client"]
+  },
+  "include": ["src/ui"],
+  "exclude": []
+}

@@ -1,0 +1,24 @@
+Agent Lanes for Chrome
+Copyright 2026 ZipLyne Agency
+
+This product includes software derived from Microsoft Playwright
+(https://github.com/microsoft/playwright), Copyright (c) Microsoft Corporation,
+licensed under the Apache License, Version 2.0. The extension in extension/ is
+derived from the Playwright browser extension at upstream commit
+d5a185a894ab3ab17ff77a44e116a1339c6bdaed; extension/UPSTREAM.md lists every
+local change.
+
+The "key" in extension/manifest.json is the public key of Microsoft's Playwright
+browser extension, copied unchanged from the upstream source. It is reused only so
+that @playwright/mcp, which hardcodes the resulting extension ID
+(mmlmfjhmonkocbjadbfplnigmagldckm), can connect to this build. It does not let
+anyone publish this build under Microsoft's listing, and this build must not be
+installed alongside the Chrome Web Store "Playwright MCP Bridge" extension.
+
+At runtime this project installs, unmodified and at pinned versions,
+@playwright/mcp (Apache-2.0, Microsoft) and chrome-devtools-mcp (Apache-2.0,
+Google).
+
+Not affiliated with or endorsed by Google LLC or Microsoft Corporation. Chrome and
+Google Chrome are trademarks of Google LLC. Playwright is a trademark of Microsoft
+Corporation.

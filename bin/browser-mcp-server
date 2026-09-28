@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# Start the requested browser MCP transport. This process owns its exact child
+# and never starts or stops the user's Chrome.
+#
+#   browser-mcp-server playwright           authenticated lanes in the user's own Chrome
+#   browser-mcp-server playwright-isolated  clean, logged-out headless Chromium
+#   browser-mcp-server chrome-devtools      Chrome DevTools MCP, for debugging only
+set -euo pipefail
+
+mode="${1:-}"
+launcher_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+state_root="${BROWSER_MCP_STATE_ROOT:-$HOME/.local/state/agent-lanes}"
+lease_file="${BROWSER_MCP_LEASE_FILE:-$state_root/${mode}.lease.pid}"
+owner_start_file="$state_root/${mode}.owner-start"
+extension_token_file="${PLAYWRIGHT_MCP_EXTENSION_TOKEN_FILE:-$HOME/.config/agent-lanes/token}"
+native_bridge="${PLAYWRIGHT_MCP_NATIVE_BRIDGE:-$launcher_dir/playwright-mcp-native-bridge}"
+native_manifest="${PLAYWRIGHT_MCP_NATIVE_MANIFEST:-$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/agency.ziplyne.agent_lanes.json}"
+canary_dir="${PLAYWRIGHT_MCP_CANARY_DIR:-$HOME/.local/share/agent-lanes/extension}"
+canary_profile_dir="${PLAYWRIGHT_MCP_CANARY_PROFILE_DIR:-$HOME/Library/Application Support/Google/Chrome/Default}"
+# Page-initiated new tabs make Chromium Show() the receiving window, which on
+# macOS activates it; an agent lane must never become Chrome's key window. The
+# init script turns such opens into same-tab navigations for every agent page.
+lane_popups_script="${PLAYWRIGHT_MCP_LANE_POPUPS_SCRIPT:-$HOME/.local/lib/agent-lanes/lane-popups.js}"
+# A lane renders one session at a time, so an action may legitimately wait
+# behind the other sessions in its lane before it can run. Playwright's default
+# 5 s action timeout is sized for an exclusive browser; a shared lane gets 20 s.
+lane_action_timeout_ms="${PLAYWRIGHT_MCP_LANE_ACTION_TIMEOUT_MS:-20000}"
+canary_pin_file="${PLAYWRIGHT_MCP_CANARY_PIN_FILE:-$HOME/.config/agent-lanes/extension-pin.json}"
+chrome_background_safe="$launcher_dir/chrome-background-safe"
+isolated_executable="${PLAYWRIGHT_ISOLATED_EXECUTABLE:-}"
+child_pid=""
+lease_owned="0"
+
+process_start() {
+  ps -p "$1" -o lstart= 2>/dev/null | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'
+}
+
+load_extension_token() {
+  unset PLAYWRIGHT_MCP_EXTENSION_TOKEN
+  PLAYWRIGHT_MCP_EXTENSION_TOKEN_FILE="$extension_token_file"
+  export PLAYWRIGHT_MCP_EXTENSION_TOKEN_FILE
+  if ! "$native_bridge" --check-token >/dev/null 2>&1; then
+    printf 'browser-mcp-server: authenticated Playwright requires an owner-only extension token file with mode 0600 at %s\n' \
+      "$extension_token_file" >&2
+    return 1
+  fi
+}
+
+verify_native_bridge_install() {
+  [ -x "$native_bridge" ] || return 1
+  [ -f "$native_manifest" ] || return 1
+  /usr/bin/python3 - "$native_manifest" "$native_bridge" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+expected_bridge = str(pathlib.Path(sys.argv[2]).resolve())
+if manifest.get("name") != "agency.ziplyne.agent_lanes":
+    raise SystemExit(1)
+if str(pathlib.Path(manifest.get("path", "")).resolve()) != expected_bridge:
+    raise SystemExit(1)
+if manifest.get("allowed_origins") != ["chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/"]:
+    raise SystemExit(1)
+PY
+}
+
+verify_canary_install() {
+  [ -f "$canary_dir/manifest.json" ] || return 1
+  /usr/bin/python3 - "$canary_profile_dir" "$canary_dir" "$canary_pin_file" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+profile_dir = pathlib.Path(sys.argv[1]).resolve()
+expected = pathlib.Path(sys.argv[2]).resolve()
+pin_file = pathlib.Path(sys.argv[3])
+extension_id = "mmlmfjhmonkocbjadbfplnigmagldckm"
+
+records = []
+for name in ("Preferences", "Secure Preferences"):
+    try:
+        record = json.loads((profile_dir / name).read_text())["extensions"]["settings"][extension_id]
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        continue
+    records.append(record)
+
+if not records:
+    raise SystemExit(1)
+
+for record in records:
+    if record.get("from_webstore") is True or record.get("location") != 4:
+        raise SystemExit(1)
+    if record.get("disable_reasons") or record.get("state") == 0:
+        raise SystemExit(1)
+    raw_path = record.get("path")
+    if not isinstance(raw_path, str):
+        raise SystemExit(1)
+    candidate = pathlib.Path(raw_path)
+    candidates = [candidate.resolve()] if candidate.is_absolute() else [
+        (profile_dir / candidate).resolve(),
+        (profile_dir / "Extensions" / candidate).resolve(),
+    ]
+    if expected not in candidates:
+        raise SystemExit(1)
+
+# install-extension writes an owner-only pin file *outside* the install,
+# recording a hash of dist/.install-manifest.json. The manifest itself sits
+# beside the files it attests, so trusting it alone would let an attacker (or
+# a stray build) edit an extension file and rewrite the manifest to match.
+# The pin is the anchor: it must be a regular file we own with mode 0600, and
+# it must name this exact canary directory as its "dest".
+def read_pin():
+    try:
+        pin_stat = pin_file.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(pin_stat.st_mode):
+        return None
+    if pin_stat.st_uid != os.getuid():
+        return None
+    if stat.S_IMODE(pin_stat.st_mode) != 0o600:
+        return None
+    try:
+        pin = json.loads(pin_file.read_text())
+    except (OSError, ValueError):
+        return None
+    try:
+        pinned_dest = pathlib.Path(pin["dest"]).resolve()
+        manifest_sha256 = pin["manifestSha256"]
+        pinned_version = pin["version"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(manifest_sha256, str) or pinned_dest != expected:
+        return None
+    if not isinstance(pinned_version, str):
+        return None
+    return manifest_sha256, pinned_version
+
+
+pinned = read_pin()
+if pinned is None:
+    print("browser-mcp-server: canary install pin missing or unsafe", file=sys.stderr)
+    raise SystemExit(1)
+pinned_manifest_sha256, pinned_version = pinned
+
+manifest_path = expected / ".install-manifest.json"
+try:
+    manifest_bytes = manifest_path.read_bytes()
+except OSError:
+    print("browser-mcp-server: canary install manifest mismatch", file=sys.stderr)
+    raise SystemExit(1)
+
+if hashlib.sha256(manifest_bytes).hexdigest() != pinned_manifest_sha256:
+    print("browser-mcp-server: canary install manifest mismatch", file=sys.stderr)
+    raise SystemExit(1)
+
+# install-extension records every installed file's hash so a partial
+# copy, a hand-edited file, or a directory swapped in some other way is
+# refused rather than silently trusted.
+try:
+    install_manifest = json.loads(manifest_bytes)
+    files = install_manifest["files"]
+    if not isinstance(files, dict):
+        raise ValueError("files must be an object")
+    for relative_path, expected_hash in files.items():
+        actual_hash = hashlib.sha256((expected / relative_path).read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise ValueError(f"hash mismatch for {relative_path}")
+except (FileNotFoundError, KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+    print("browser-mcp-server: canary install manifest mismatch", file=sys.stderr)
+    raise SystemExit(1)
+
+# The pin binds a version too: the pinned version, the hash-attested install
+# manifest's version, and the extension manifest.json actually loaded by
+# Chrome must all agree, or a stale pin/manifest paired with a newer (or
+# older) extension build is refused rather than trusted.
+try:
+    extension_manifest_version = json.loads((expected / "manifest.json").read_text())["version"]
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    print("browser-mcp-server: canary install version mismatch", file=sys.stderr)
+    raise SystemExit(1)
+
+install_manifest_version = install_manifest.get("version")
+if not (pinned_version == install_manifest_version == extension_manifest_version):
+    print("browser-mcp-server: canary install version mismatch", file=sys.stderr)
+    raise SystemExit(1)
+
+# Completeness: a file added to dist/ but never recorded in the manifest must
+# not be silently trusted either. Symlinks are refused outright rather than
+# resolved, since a symlink can point at content the manifest never hashed.
+listed = set(files)
+for root, dirs, filenames in os.walk(expected):
+    for name in list(dirs) + filenames:
+        entry = pathlib.Path(root) / name
+        if entry.is_symlink():
+            print("browser-mcp-server: canary install contains unlisted files", file=sys.stderr)
+            raise SystemExit(1)
+    for name in filenames:
+        entry = pathlib.Path(root) / name
+        relative = entry.relative_to(expected).as_posix()
+        if relative == ".install-manifest.json":
+            continue
+        if relative not in listed:
+            print("browser-mcp-server: canary install contains unlisted files", file=sys.stderr)
+            raise SystemExit(1)
+
+raise SystemExit(0)
+PY
+}
+
+verify_chrome_background_safe() {
+  [ -x "$chrome_background_safe" ] || return 1
+  "$chrome_background_safe" --check >/dev/null 2>&1
+}
+
+vendored_runtime_dir="${BROWSER_MCP_VENDORED_RUNTIME_DIR:-$HOME/.local/lib/agent-lanes}"
+
+# Resolve the vendored copy of an MCP server package, verifying it exists at
+# exactly the pinned version before trusting it over the npx fallback. Prints
+# the package's entry script path on success; prints nothing on failure.
+resolve_mcp_entry() {
+  local package="$1" version="$2" bin_relpath="$3"
+  local package_dir="$vendored_runtime_dir/node_modules/$package"
+  local entry="$package_dir/$bin_relpath"
+  [ -f "$entry" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  local installed_version
+  installed_version="$(PACKAGE_JSON="$package_dir/package.json" node -p "require(process.env.PACKAGE_JSON).version" 2>/dev/null)" || return 1
+  [ "$installed_version" = "$version" ] || return 1
+  printf '%s\n' "$entry"
+}
+
+resolve_isolated_executable() {
+  if [ -n "$isolated_executable" ]; then
+    [ -x "$isolated_executable" ] || return 1
+    return 0
+  fi
+  local cache_setting="${PLAYWRIGHT_BROWSERS_PATH:-}"
+  local -a cache_roots=()
+  if [ -z "$cache_setting" ]; then
+    cache_roots+=("$HOME/Library/Caches/ms-playwright")
+  elif [ "$cache_setting" != "0" ]; then
+    cache_roots+=("$cache_setting")
+  else
+    # PLAYWRIGHT_BROWSERS_PATH=0 installs beside playwright-core. Cover both a
+    # conventional global install and npx's configured content-addressed cache.
+    local npm_cache="${npm_config_cache:-}"
+    if [ -z "$npm_cache" ] && command -v npm >/dev/null 2>&1; then
+      npm_cache="$(npm config get cache 2>/dev/null || true)"
+    fi
+    cache_roots+=("$HOME/.local/lib/node_modules")
+    [ -n "$npm_cache" ] && cache_roots+=("$npm_cache/_npx")
+  fi
+  local root
+  local -a existing_roots=()
+  for root in "${cache_roots[@]}"; do
+    [ -d "$root" ] && existing_roots+=("$root")
+  done
+  [ "${#existing_roots[@]}" -gt 0 ] || return 1
+  isolated_executable="$(find "${existing_roots[@]}" -type f \
+    -path '*/chromium_headless_shell-*/chrome-headless-shell-*/chrome-headless-shell' \
+    -perm -111 -print 2>/dev/null | sed -E \
+      's#^(.*chromium_headless_shell-([0-9]+)/.*)$#\2\t\1#' | \
+    sort -n -k1,1 | tail -n 1 | cut -f2-)"
+  [ -n "$isolated_executable" ] && [ -x "$isolated_executable" ]
+}
+
+# shellcheck disable=SC2329 # invoked by cleanup through the EXIT trap
+release_lease() {
+  if [ "$lease_owned" = "1" ] && \
+    [ "$(cat "$lease_file" 2>/dev/null || true)" = "$$" ]; then
+    rm -f -- "$lease_file" "$owner_start_file"
+  fi
+}
+
+# shellcheck disable=SC2329 # invoked by cleanup through the EXIT trap
+stop_child() {
+  if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
+    kill -TERM "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+  fi
+}
+
+# shellcheck disable=SC2329 # invoked through the EXIT trap
+cleanup() {
+  stop_child
+  release_lease
+}
+
+case "$mode" in
+  playwright|playwright-isolated|chrome-devtools) ;;
+  *)
+    printf 'usage: browser-mcp-server <playwright|playwright-isolated|chrome-devtools>\n' >&2
+    exit 2
+    ;;
+esac
+
+mkdir -p "$state_root"
+
+# Playwright extension mode is intentionally unleased. The local extension gives
+# each simultaneous client an exclusive normal, unfocused private window with exact tab ownership.
+# chrome-devtools still leases because tracing/profiling domains conflict.
+if [ "$mode" = "chrome-devtools" ]; then
+  if shlock -p "$$" -f "$lease_file"; then
+    lease_owned="1"
+    printf '%s\n' "$(process_start "$$")" > "$owner_start_file"
+  else
+    owner_pid="$(cat "$lease_file" 2>/dev/null || printf 'unknown')"
+    printf 'browser-mcp-server: another %s helper is active (pid=%s)\n' \
+      "$mode" "$owner_pid" >&2
+    exit 3
+  fi
+fi
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+case "$mode" in
+  playwright)
+    if ! verify_chrome_background_safe; then
+      printf '%s\n' \
+        'browser-mcp-server: regular Chrome is missing --disable-backgrounding-occluded-windows; fully quit Chrome with Command-Q and reopen it with the Google Chrome (Agent Safe) app' >&2
+      exit 4
+    fi
+    if ! verify_native_bridge_install; then
+      printf 'browser-mcp-server: authenticated Playwright native bridge is not installed correctly\n' >&2
+      exit 4
+    fi
+    load_extension_token || exit 4
+    if ! verify_canary_install; then
+      printf 'browser-mcp-server: the Agent Lanes extension is not loaded unpacked in Chrome from %s\n' \
+        "$canary_dir" >&2
+      exit 4
+    fi
+    # Background jobs in a non-interactive shell otherwise inherit /dev/null as
+    # stdin, which makes a stdio MCP server exit before it can answer initialize.
+    if [ ! -f "$lane_popups_script" ]; then
+      printf 'browser-mcp-server: lane popup containment script is missing at %s\n' "$lane_popups_script" >&2
+      exit 4
+    fi
+    PLAYWRIGHT_EXTENSION_PROTOCOL=91031
+    export PLAYWRIGHT_EXTENSION_PROTOCOL
+    if playwright_mcp_entry="$(resolve_mcp_entry '@playwright/mcp' '0.0.79' 'cli.js')"; then
+      node "$playwright_mcp_entry" --extension --executable-path "$native_bridge" --init-script "$lane_popups_script" --timeout-action "$lane_action_timeout_ms" <&0 &
+    else
+      printf 'browser-mcp-server: vendored @playwright/mcp not installed, falling back to npx\n' >&2
+      npx -y '@playwright/mcp@0.0.79' --extension --executable-path "$native_bridge" --init-script "$lane_popups_script" --timeout-action "$lane_action_timeout_ms" <&0 &
+    fi
+    ;;
+  playwright-isolated)
+    unset PLAYWRIGHT_MCP_EXTENSION_TOKEN PLAYWRIGHT_EXTENSION_PROTOCOL
+    if ! resolve_isolated_executable; then
+      printf 'browser-mcp-server: isolated Playwright Chromium headless shell is unavailable\n' >&2
+      exit 4
+    fi
+    if playwright_mcp_entry="$(resolve_mcp_entry '@playwright/mcp' '0.0.79' 'cli.js')"; then
+      node "$playwright_mcp_entry" --isolated --headless \
+        --executable-path "$isolated_executable" <&0 &
+    else
+      printf 'browser-mcp-server: vendored @playwright/mcp not installed, falling back to npx\n' >&2
+      npx -y '@playwright/mcp@0.0.79' --isolated --headless \
+        --executable-path "$isolated_executable" <&0 &
+    fi
+    ;;
+  chrome-devtools)
+    unset PLAYWRIGHT_MCP_EXTENSION_TOKEN PLAYWRIGHT_EXTENSION_PROTOCOL
+    # --channel stable is load-bearing: a Chrome Dev or Canary that is also running
+    # would otherwise be picked up instead of the profile you are logged in to.
+    # bin_relpath read from chrome-devtools-mcp@1.6.0's own package.json "bin"
+    # field (its "chrome-devtools-mcp" entry, matching the npx-resolved binary).
+    if chrome_devtools_mcp_entry="$(resolve_mcp_entry 'chrome-devtools-mcp' '1.6.0' 'build/src/bin/chrome-devtools-mcp.js')"; then
+      node "$chrome_devtools_mcp_entry" --autoConnect --channel stable --redactNetworkHeaders <&0 &
+    else
+      printf 'browser-mcp-server: vendored chrome-devtools-mcp not installed, falling back to npx\n' >&2
+      npx -y 'chrome-devtools-mcp@1.6.0' --autoConnect --channel stable --redactNetworkHeaders <&0 &
+    fi
+    ;;
+esac
+child_pid="$!"
+
+set +e
+wait "$child_pid"
+status="$?"
+set -e
+child_pid=""
+exit "$status"

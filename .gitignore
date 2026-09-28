@@ -1,0 +1,7 @@
+node_modules/
+extension/out/
+extension/dist/
+.DS_Store
+__pycache__/
+*.py[cod]
+*.zip

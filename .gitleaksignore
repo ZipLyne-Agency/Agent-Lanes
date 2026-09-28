@@ -1,0 +1,4 @@
+# The manifest "key" is the public key of Microsoft's Playwright extension, reused so
+# @playwright/mcp resolves the same extension ID. It is public, not a secret.
+extension/manifest.json:generic-api-key:38
+extension/out/manifest.json:generic-api-key:38

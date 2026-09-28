@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+# PRINCIPLES: max-lines-exception — service module for native browser bridge orchestration.
+"""Local-only rendezvous between Playwright MCP and the Chrome extension."""
+
+from __future__ import annotations
+
+import hmac
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+from typing import BinaryIO
+from urllib.parse import parse_qs, urlsplit
+import uuid
+
+EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
+EXTENSION_ORIGIN = f"chrome-extension://{EXTENSION_ID}/"
+CONNECT_PATH = "/connect.html"
+PROTOCOL_VERSION = "91031"
+MAX_NATIVE_MESSAGE = 1024 * 1024
+MAX_SOCKET_MESSAGE = 64 * 1024
+# Bounds how many requests can be in flight to the extension at once, so a
+# burst of concurrent clients can't grow self.pending without limit while
+# each waits on its own acknowledgement.
+MAX_PENDING_REQUESTS = 64
+TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+DEFAULT_ACK_TIMEOUT = 10
+PREPARE_POOL_ACK_TIMEOUT = 90
+# The extension may queue a connecting client up to CAPACITY_WAIT_MS (60s, see
+# design doc's Session lifecycle) while every lane is at capacity, so the
+# connect acknowledgement needs headroom beyond that wait.
+CONNECT_ACK_TIMEOUT = 75
+
+
+def read_socket_line(connection: socket.socket, timeout: float) -> bytes:
+    """Read one bounded JSON line without allowing a partial peer to hang."""
+    deadline = time.monotonic() + timeout
+    data = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("native bridge socket read timed out")
+        connection.settimeout(remaining)
+        try:
+            chunk = connection.recv(min(4096, MAX_SOCKET_MESSAGE + 1 - len(data)))
+        except socket.timeout as error:
+            # Python 3.9 (the macOS system python3) raises socket.timeout, which
+            # only became an alias of TimeoutError in 3.10.
+            raise TimeoutError("native bridge socket read timed out") from error
+        if not chunk:
+            raise ValueError("incomplete native bridge message")
+        data.extend(chunk)
+        newline = data.find(b"\n")
+        if newline >= 0:
+            if newline != len(data) - 1:
+                raise ValueError("multiple native bridge messages are not allowed")
+            return bytes(data)
+        if len(data) > MAX_SOCKET_MESSAGE:
+            raise ValueError("native bridge message exceeds size limit")
+
+def browser_session_id() -> str:
+    """Opaque identity for the current Chrome parent process lifetime."""
+    parent_pid = os.getppid()
+    try:
+        started = subprocess.check_output(
+            ["/bin/ps", "-p", str(parent_pid), "-o", "lstart="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        started = "unknown"
+    identity = f"{os.getuid()}:{parent_pid}:{started}".encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+def _state_path() -> Path:
+    override = os.environ.get("PLAYWRIGHT_MCP_NATIVE_SOCKET")
+    if override:
+        return Path(override)
+    return Path.home() / ".local/state/agent-lanes/native-bridge.sock"
+
+def _token_path() -> Path:
+    override = os.environ.get("PLAYWRIGHT_MCP_EXTENSION_TOKEN_FILE")
+    if override:
+        return Path(override)
+    return Path.home() / ".config/agent-lanes/token"
+
+
+CHROME_BUNDLE_ID = "com.google.Chrome"
+# Background preparation creates lane windows on the invisible agent display
+# while another app is in front. Chromium shows an unfocused extension window
+# with orderWindow:NSWindowBelow and no app activation, but macOS focus rules
+# have surprised this route before, so the first time Chrome comes forward
+# during a background preparation this fuse file is written and background
+# preparation stays off until someone deletes it.
+FRONTMOST_SAMPLE_SECONDS = 0.05
+FRONTMOST_SETTLE_SECONDS = 3.0
+
+
+def _background_fuse_path() -> Path:
+    override = os.environ.get("PLAYWRIGHT_MCP_BACKGROUND_FUSE")
+    if override:
+        return Path(override)
+    return Path.home() / ".local/state/agent-lanes/background-prep-disabled.json"
+
+
+def frontmost_bundle_id() -> str | None:
+    """Bundle ID of the frontmost app, read through lsappinfo (no TCC prompt)."""
+    override = os.environ.get("PLAYWRIGHT_MCP_FRONTMOST_COMMAND")
+    try:
+        if override:
+            return subprocess.check_output([override], text=True, timeout=2).strip() or None
+        asn = subprocess.check_output(["/usr/bin/lsappinfo", "front"], text=True, timeout=2).strip()
+        if not asn.startswith("ASN:"):
+            return None
+        info = subprocess.check_output(["/usr/bin/lsappinfo", "info", "-only", "bundleid", asn], text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in info.splitlines():
+        line = line.strip()
+        if line.startswith('"CFBundleIdentifier"=') or line.startswith("bundleID="):
+            return line.split("=", 1)[1].strip().strip('"') or None
+    return None
+
+
+class FrontmostWatch:
+    """Samples the frontmost app until stopped and remembers every value seen."""
+
+    def __init__(self) -> None:
+        self.seen: list[str | None] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> "FrontmostWatch":
+        self.seen.append(frontmost_bundle_id())
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop.wait(FRONTMOST_SAMPLE_SECONDS):
+            self.seen.append(frontmost_bundle_id())
+
+
+def trip_background_fuse(before: str | None, seen: list[str | None], created: int) -> None:
+    path = _background_fuse_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.write_text(json.dumps({
+        "disabledAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "frontmostBefore": before,
+        "frontmostSeen": sorted({value for value in seen if value}),
+        "lanesCreated": created,
+        "reenable": f"rm {path}",
+    }, indent=2) + "\n")
+
+
+def _single(params: dict[str, list[str]], name: str) -> str:
+    values = params.get(name)
+    if values is None or len(values) != 1 or not values[0]:
+        raise ValueError(f"missing or duplicate {name}")
+    return values[0]
+
+
+def validate_connect_url(raw_url: str) -> dict[str, str]:
+    parsed = urlsplit(raw_url)
+    if parsed.scheme != "chrome-extension" or parsed.netloc != EXTENSION_ID or parsed.path != CONNECT_PATH:
+        raise ValueError("unexpected extension connect URL")
+    if parsed.fragment:
+        raise ValueError("extension connect URL must not contain a fragment")
+    params = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    unexpected = set(params) - {"mcpRelayUrl", "protocolVersion", "client"}
+    if unexpected:
+        if "token" in unexpected:
+            raise ValueError("extension token must not appear in the connect URL")
+        raise ValueError("unexpected extension connect parameter")
+    if _single(params, "protocolVersion") != PROTOCOL_VERSION:
+        raise ValueError("unsupported extension protocol version")
+
+    relay_url = _single(params, "mcpRelayUrl")
+    relay = urlsplit(relay_url)
+    if relay.scheme != "ws" or relay.hostname not in {"127.0.0.1", "::1"}:
+        raise ValueError("MCP relay must use a loopback WebSocket")
+    if relay.username is not None or relay.password is not None:
+        raise ValueError("MCP relay credentials are not allowed")
+    try:
+        relay_port = relay.port
+    except ValueError as error:
+        raise ValueError("MCP relay port is invalid") from error
+    if relay_port is None:
+        raise ValueError("MCP relay port is required")
+
+    client_name = "unknown"
+    raw_client = params.get("client")
+    if raw_client is not None:
+        if len(raw_client) != 1:
+            raise ValueError("duplicate client metadata")
+        try:
+            client = json.loads(raw_client[0])
+        except json.JSONDecodeError as error:
+            raise ValueError("invalid client metadata") from error
+        candidate = client.get("name") if isinstance(client, dict) else None
+        if isinstance(candidate, str) and candidate.strip():
+            client_name = candidate.strip()
+    if len(client_name) > 128:
+        raise ValueError("client name is too long")
+    return {"relayUrl": relay_url, "clientName": client_name}
+
+
+def read_token_file(path: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError("extension token path must be a regular file") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("extension token path must be a regular file")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("extension token file must be owner-only mode 0600")
+        raw_token = os.read(descriptor, 256)
+    finally:
+        os.close(descriptor)
+    try:
+        token = raw_token.decode("utf-8").splitlines()[0] if raw_token else ""
+    except UnicodeDecodeError as error:
+        raise ValueError("extension token file is malformed") from error
+    if not 32 <= len(token) <= 128 or any(character not in TOKEN_CHARS for character in token):
+        raise ValueError("extension token file is malformed")
+    return token
+
+
+def validate_parked_workspace_summaries(value: object) -> list[dict]:
+    """Return a bounded, non-sensitive status shape or fail closed to empty."""
+    if not isinstance(value, list) or len(value) > 8:
+        return []
+    summaries: list[dict] = []
+    allowed_types = {"popup", "normal", "missing"}
+    allowed_states = {"normal", "minimized", "maximized", "fullscreen", "locked-fullscreen", "missing"}
+    for item in value:
+        if not isinstance(item, dict):
+            return []
+        window_id = item.get("windowId")
+        window_type = item.get("type")
+        state = item.get("state")
+        focused = item.get("focused")
+        tab_count = item.get("tabCount")
+        if (not isinstance(window_id, int) or isinstance(window_id, bool) or window_id < 1 or
+                window_type not in allowed_types or state not in allowed_states or
+                (focused is not None and not isinstance(focused, bool)) or
+                not isinstance(tab_count, int) or isinstance(tab_count, bool) or not -1 <= tab_count <= 256):
+            return []
+        summary = {
+            "windowId": window_id,
+            "type": window_type,
+            "state": state,
+            "focused": focused,
+            "tabCount": tab_count,
+        }
+        # Lane telemetry (see design doc's per-lane stage scheduler): optional,
+        # but a malformed value fails the whole batch closed like every other
+        # field here.
+        if "sessionCount" in item:
+            session_count = item["sessionCount"]
+            if (not isinstance(session_count, int) or isinstance(session_count, bool) or
+                    not 0 <= session_count <= 256):
+                return []
+            summary["sessionCount"] = session_count
+        if "capacity" in item:
+            capacity = item["capacity"]
+            if not isinstance(capacity, int) or isinstance(capacity, bool) or not 1 <= capacity <= 256:
+                return []
+            summary["capacity"] = capacity
+        summaries.append(summary)
+    return summaries
+
+
+def validate_pool_capacity_summary(value: object) -> dict[str, int]:
+    """Optional top-level {lanes, perLane, total, inUse} pool counts. Unlike
+    the per-workspace fields above, this is purely diagnostic, so a malformed
+    field is dropped rather than rejecting the whole summary."""
+    if not isinstance(value, dict):
+        return {}
+    summary: dict[str, int] = {}
+    for field in ("lanes", "perLane", "total", "inUse"):
+        number = value.get(field)
+        if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
+            summary[field] = number
+    return summary
+
+
+def _read_exact(stream: BinaryIO, size: int) -> bytes | None:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = stream.read(size - len(chunks))
+        if not chunk:
+            return None
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def read_native_message(stream: BinaryIO) -> dict | None:
+    header = _read_exact(stream, 4)
+    if header is None:
+        return None
+    (size,) = struct.unpack("=I", header)
+    if size > MAX_NATIVE_MESSAGE:
+        raise ValueError("native message exceeds size limit")
+    payload = _read_exact(stream, size)
+    if payload is None:
+        raise ValueError("truncated native message")
+    message = json.loads(payload.decode("utf-8"))
+    if not isinstance(message, dict):
+        raise ValueError("native message must be an object")
+    return message
+
+
+def write_native_message(stream: BinaryIO, message: dict) -> None:
+    payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    if len(payload) > MAX_NATIVE_MESSAGE:
+        raise ValueError("native message exceeds size limit")
+    stream.write(struct.pack("=I", len(payload)))
+    stream.write(payload)
+    stream.flush()
+
+
+class _NativeBridgeBusy(Exception):
+    """Raised internally when MAX_PENDING_REQUESTS is already in flight."""
+
+
+class NativeHost:
+    def __init__(
+        self,
+        socket_path: Path,
+        token_path: Path,
+        *,
+        native_output: BinaryIO | None = None,
+    ):
+        self.socket_path = socket_path
+        self.token_path = token_path
+        self.native_output = native_output or sys.stdout.buffer
+        self.stop_event = threading.Event()
+        self.write_lock = threading.Lock()
+        self.pending_lock = threading.Lock()
+        self.pending: dict[str, tuple[threading.Event, dict]] = {}
+        self.server: socket.socket | None = None
+
+    def run(self) -> int:
+        self._open_socket()
+        write_native_message(self.native_output, {
+            "type": "hostReady",
+            "browserSessionId": browser_session_id(),
+        })
+        accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        accept_thread.start()
+        try:
+            while True:
+                message = read_native_message(sys.stdin.buffer)
+                if message is None:
+                    break
+                self._receive_extension_message(message)
+        finally:
+            self.stop_event.set()
+            if self.server is not None:
+                self.server.close()
+            try:
+                if self.socket_path.is_socket():
+                    self.socket_path.unlink()
+            except OSError:
+                pass
+        return 0
+
+    def _open_socket(self) -> None:
+        parent = self.socket_path.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_info = parent.lstat()
+        if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode) or parent_info.st_uid != os.getuid():
+            raise ValueError("native bridge state directory is unsafe")
+        parent.chmod(0o700)
+        if self.socket_path.exists() or self.socket_path.is_symlink():
+            if self.socket_path.is_symlink() or not self.socket_path.is_socket():
+                raise ValueError("native bridge socket path is unsafe")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(str(self.socket_path))
+            except OSError:
+                self.socket_path.unlink()
+            else:
+                raise ValueError("another native bridge host is active")
+            finally:
+                probe.close()
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(str(self.socket_path))
+        self.socket_path.chmod(0o600)
+        self.server.listen(16)
+
+    def _accept_loop(self) -> None:
+        assert self.server is not None
+        while not self.stop_event.is_set():
+            try:
+                connection, _ = self.server.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle_client, args=(connection,), daemon=True).start()
+
+    def _handle_client(self, connection: socket.socket) -> None:
+        with connection:
+            request_id: str | None = None
+            try:
+                raw = read_socket_line(connection, 2)
+                if not raw or len(raw) > MAX_SOCKET_MESSAGE or not raw.endswith(b"\n"):
+                    raise ValueError("invalid native bridge request")
+                envelope = json.loads(raw)
+                if not isinstance(envelope, dict) or not isinstance(envelope.get("auth"), str):
+                    raise ValueError("invalid native bridge request")
+                expected_token = read_token_file(self.token_path)
+                if not hmac.compare_digest(envelope["auth"], expected_token):
+                    raise ValueError("invalid native bridge authentication")
+                if set(envelope) == {"url", "auth"} and isinstance(envelope["url"], str):
+                    request = {"type": "connect", **validate_connect_url(envelope["url"])}
+                elif set(envelope) == {"status", "auth"} and envelope["status"] is True:
+                    request = {"type": "status"}
+                elif set(envelope) in ({"preparePool", "auth"}, {"preparePool", "auth", "background"}):
+                    target_capacity = envelope["preparePool"]
+                    if not isinstance(target_capacity, int) or isinstance(target_capacity, bool) or not 1 <= target_capacity <= 8:
+                        raise ValueError("invalid pool capacity")
+                    request = {"type": "preparePool", "targetCapacity": target_capacity}
+                    if "background" in envelope:
+                        if envelope["background"] is not True:
+                            raise ValueError("invalid background flag")
+                        request["background"] = True
+                elif set(envelope) == {"discardPool", "auth"} and envelope["discardPool"] is True:
+                    request = {"type": "discardPool"}
+                else:
+                    raise ValueError("invalid native bridge request")
+                request_id = uuid.uuid4().hex
+                event = threading.Event()
+                result: dict = {}
+                with self.pending_lock:
+                    if len(self.pending) >= MAX_PENDING_REQUESTS:
+                        raise _NativeBridgeBusy()
+                    self.pending[request_id] = (event, result)
+                with self.write_lock:
+                    write_native_message(self.native_output, {
+                        "requestId": request_id,
+                        **request,
+                    })
+                if request["type"] == "connect":
+                    acknowledgement_timeout = CONNECT_ACK_TIMEOUT
+                elif request["type"] in {"preparePool", "discardPool"}:
+                    acknowledgement_timeout = PREPARE_POOL_ACK_TIMEOUT
+                else:
+                    acknowledgement_timeout = DEFAULT_ACK_TIMEOUT
+                if not event.wait(timeout=acknowledgement_timeout):
+                    raise ValueError("extension connection acknowledgement timed out")
+                response = {"ok": bool(result.get("ok"))}
+                if request["type"] == "status" and response["ok"]:
+                    response["connections"] = result.get("connections", [])
+                    if result.get("laneWindowState") in {"normal", "fullscreen"}:
+                        response["laneWindowState"] = result["laneWindowState"]
+                    response["diagnostic"] = result.get("diagnostic")
+                    response["parkedWorkspaceCount"] = result.get("parkedWorkspaceCount", 0)
+                    response["parkedWorkspaceIds"] = result.get("parkedWorkspaceIds", [])
+                    response["parkedWorkspaces"] = result.get("parkedWorkspaces", [])
+                    if "capacity" in result:
+                        response["capacity"] = result["capacity"]
+                    if "agentDisplay" in result:
+                        response["agentDisplay"] = result["agentDisplay"]
+                    if "extensionVersion" in result:
+                        response["extensionVersion"] = result["extensionVersion"]
+                if request["type"] == "preparePool" and response["ok"]:
+                    response["created"] = result.get("created", 0)
+                    response["parkedWorkspaceCount"] = result.get("parkedWorkspaceCount", 0)
+                    response["parkedWorkspaceIds"] = result.get("parkedWorkspaceIds", [])
+                if request["type"] == "discardPool" and response["ok"]:
+                    response["removed"] = result.get("removed", 0)
+                    response["preserved"] = result.get("preserved", 0)
+                    response["parkedWorkspaceCount"] = result.get("parkedWorkspaceCount", 0)
+                if not response["ok"]:
+                    response["error"] = result.get("diagnostic", "extension rejected the connection")
+            except _NativeBridgeBusy:
+                response = {"ok": False, "error": "native bridge is busy"}
+            except (OSError, ValueError, json.JSONDecodeError):
+                response = {"ok": False, "error": "native bridge request rejected"}
+            finally:
+                if request_id is not None:
+                    with self.pending_lock:
+                        self.pending.pop(request_id, None)
+            connection.sendall(json.dumps(response, separators=(",", ":")).encode() + b"\n")
+
+    def _receive_extension_message(self, message: dict) -> None:
+        if message.get("type") not in {"connectResult", "statusResult", "preparePoolResult", "discardPoolResult"} or not isinstance(message.get("requestId"), str):
+            return
+        with self.pending_lock:
+            pending = self.pending.get(message["requestId"])
+        if pending is None:
+            return
+        event, result = pending
+        result["ok"] = message.get("ok") is True
+        if message.get("type") == "statusResult" and isinstance(message.get("connections"), list):
+            result["connections"] = message["connections"]
+            if message.get("laneWindowState") in {"normal", "fullscreen"}:
+                result["laneWindowState"] = message["laneWindowState"]
+            if isinstance(message.get("parkedWorkspaceCount"), int):
+                result["parkedWorkspaceCount"] = message["parkedWorkspaceCount"]
+            if isinstance(message.get("parkedWorkspaceIds"), list):
+                result["parkedWorkspaceIds"] = message["parkedWorkspaceIds"]
+            result["parkedWorkspaces"] = validate_parked_workspace_summaries(message.get("parkedWorkspaces"))
+            if isinstance(message.get("diagnostic"), str):
+                result["diagnostic"] = message["diagnostic"]
+            capacity = validate_pool_capacity_summary(message.get("capacity"))
+            if capacity:
+                result["capacity"] = capacity
+            agent_display = message.get("agentDisplay")
+            if (isinstance(agent_display, dict) and isinstance(agent_display.get("present"), bool) and
+                    isinstance(agent_display.get("lanesOnDisplay"), int) and not isinstance(agent_display.get("lanesOnDisplay"), bool) and
+                    0 <= agent_display["lanesOnDisplay"] <= 8):
+                result["agentDisplay"] = {"present": agent_display["present"], "lanesOnDisplay": agent_display["lanesOnDisplay"]}
+            version = message.get("extensionVersion")
+            if isinstance(version, str) and len(version) <= 32 and all(part.isdigit() for part in version.split(".")):
+                result["extensionVersion"] = version
+        if message.get("type") == "preparePoolResult":
+            if isinstance(message.get("created"), int):
+                result["created"] = message["created"]
+            if isinstance(message.get("parkedWorkspaceCount"), int):
+                result["parkedWorkspaceCount"] = message["parkedWorkspaceCount"]
+            if isinstance(message.get("parkedWorkspaceIds"), list):
+                result["parkedWorkspaceIds"] = message["parkedWorkspaceIds"]
+            if isinstance(message.get("diagnostic"), str):
+                result["diagnostic"] = message["diagnostic"][:256]
+        if message.get("type") == "discardPoolResult":
+            for field in ("removed", "preserved", "parkedWorkspaceCount"):
+                if isinstance(message.get(field), int):
+                    result[field] = message[field]
+            if isinstance(message.get("diagnostic"), str):
+                result["diagnostic"] = message["diagnostic"][:256]
+        event.set()
+
+
+def run_client(raw_url: str, socket_path: Path, token_path: Path) -> int:
+    # Validate the non-secret URL shape before it crosses the local socket. The
+    # native host performs the authoritative token and relay validation.
+    try:
+        validate_connect_url(raw_url)
+        token = read_token_file(token_path)
+    except (OSError, ValueError):
+        print("playwright-mcp-native-bridge: refused unexpected URL", file=sys.stderr)
+        return 2
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                connection.connect(str(socket_path))
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    print("playwright-mcp-native-bridge: Chrome native host is unavailable", file=sys.stderr)
+                    return 3
+                time.sleep(0.02)
+        connection.sendall(json.dumps({"url": raw_url, "auth": token}, separators=(",", ":")).encode() + b"\n")
+        # Match the host's CONNECT_ACK_TIMEOUT plus margin: the extension may
+        # queue this client while every lane is at capacity.
+        raw_response = read_socket_line(connection, CONNECT_ACK_TIMEOUT + 5)
+        response = json.loads(raw_response)
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            print("playwright-mcp-native-bridge: extension connection failed", file=sys.stderr)
+            return 4
+        return 0
+    except (OSError, json.JSONDecodeError):
+        print("playwright-mcp-native-bridge: native bridge communication failed", file=sys.stderr)
+        return 4
+    finally:
+        connection.close()
+
+
+def run_status(socket_path: Path, token_path: Path) -> int:
+    try:
+        token = read_token_file(token_path)
+    except (OSError, ValueError):
+        return 2
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.connect(str(socket_path))
+        connection.sendall(json.dumps({"status": True, "auth": token}, separators=(",", ":")).encode() + b"\n")
+        raw_response = read_socket_line(connection, 15)
+        response = json.loads(raw_response)
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            return 3
+        payload = {
+            "connections": response.get("connections", []),
+            "diagnostic": response.get("diagnostic"),
+            "parkedWorkspaceCount": response.get("parkedWorkspaceCount", 0),
+            "parkedWorkspaceIds": response.get("parkedWorkspaceIds", []),
+            "parkedWorkspaces": response.get("parkedWorkspaces", []),
+        }
+        if isinstance(response.get("capacity"), dict):
+            payload["capacity"] = response["capacity"]
+        if response.get("laneWindowState") in {"normal", "fullscreen"}:
+            payload["laneWindowState"] = response["laneWindowState"]
+        if isinstance(response.get("agentDisplay"), dict):
+            payload["agentDisplay"] = response["agentDisplay"]
+        if isinstance(response.get("extensionVersion"), str):
+            payload["extensionVersion"] = response["extensionVersion"]
+        payload["backgroundPreparation"] = "disabled" if _background_fuse_path().exists() else "enabled"
+        print(json.dumps(payload, separators=(",", ":")))
+        return 0
+    except (OSError, json.JSONDecodeError):
+        return 3
+    finally:
+        connection.close()
+
+
+def _send_prepare_pool(socket_path: Path, token: str, target_capacity: int, background: bool) -> dict | None:
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.connect(str(socket_path))
+        envelope: dict = {"preparePool": target_capacity, "auth": token}
+        if background:
+            envelope["background"] = True
+        connection.sendall(json.dumps(envelope, separators=(",", ":")).encode() + b"\n")
+        response = json.loads(read_socket_line(connection, PREPARE_POOL_ACK_TIMEOUT + 5))
+        return response if isinstance(response, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+    finally:
+        connection.close()
+
+
+def run_prepare_pool(socket_path: Path, token_path: Path, target_capacity: int, background: bool = False) -> int:
+    try:
+        token = read_token_file(token_path)
+    except (OSError, ValueError):
+        return 2
+    # Background mode applies only while another app is in front and the fuse
+    # is intact; otherwise this is the ordinary foreground-only request.
+    before = frontmost_bundle_id() if background else None
+    use_background = background and not _background_fuse_path().exists() and before not in {None, CHROME_BUNDLE_ID}
+    if use_background:
+        with FrontmostWatch() as watch:
+            response = _send_prepare_pool(socket_path, token, target_capacity, True)
+            time.sleep(FRONTMOST_SETTLE_SECONDS)
+        created = response.get("created", 0) if isinstance(response, dict) else 0
+        # Only a request that provably made no window is excused. A failure
+        # may have created and rolled back windows, so it counts too.
+        made_nothing = isinstance(response, dict) and response.get("ok") is True and created == 0
+        if CHROME_BUNDLE_ID in watch.seen and not made_nothing:
+            trip_background_fuse(before, watch.seen, created)
+            print("playwright-mcp-native-bridge: background lane creation brought Chrome forward; "
+                  f"background preparation is now disabled ({_background_fuse_path()})", file=sys.stderr)
+            return 4
+    else:
+        response = _send_prepare_pool(socket_path, token, target_capacity, False)
+    if response is None:
+        return 3
+    if response.get("ok") is not True:
+        if isinstance(response.get("error"), str):
+            print(f"playwright-mcp-native-bridge: {response['error']}", file=sys.stderr)
+        return 3
+    print(json.dumps({
+        "created": response.get("created", 0),
+        "parkedWorkspaceCount": response.get("parkedWorkspaceCount", 0),
+        "parkedWorkspaceIds": response.get("parkedWorkspaceIds", []),
+        "background": use_background,
+    }, separators=(",", ":")))
+    return 0
+
+
+def run_discard_pool(socket_path: Path, token_path: Path) -> int:
+    try:
+        token = read_token_file(token_path)
+    except (OSError, ValueError):
+        return 2
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.connect(str(socket_path))
+        connection.sendall(json.dumps({"discardPool": True, "auth": token}, separators=(",", ":")).encode() + b"\n")
+        raw_response = read_socket_line(connection, PREPARE_POOL_ACK_TIMEOUT + 5)
+        response = json.loads(raw_response)
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            if isinstance(response, dict) and isinstance(response.get("error"), str):
+                print(f"playwright-mcp-native-bridge: {response['error']}", file=sys.stderr)
+            return 3
+        print(json.dumps({
+            "removed": response.get("removed", 0),
+            "preserved": response.get("preserved", 0),
+            "parkedWorkspaceCount": response.get("parkedWorkspaceCount", 0),
+        }, separators=(",", ":")))
+        return 0
+    except (OSError, json.JSONDecodeError):
+        return 3
+    finally:
+        connection.close()
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) not in {2, 3, 4}:
+        print("usage: playwright-mcp-native-bridge <--check-token|--status|--prepare-pool capacity [--background]|--discard-pool|extension-origin|connect-url>", file=sys.stderr)
+        return 2
+    if len(argv) in {3, 4}:
+        if argv[1] != "--prepare-pool" or (len(argv) == 4 and argv[3] != "--background"):
+            return 2
+        try:
+            target_capacity = int(argv[2])
+        except ValueError:
+            return 2
+        if not 1 <= target_capacity <= 8:
+            return 2
+        return run_prepare_pool(_state_path(), _token_path(), target_capacity, background=len(argv) == 4)
+    if argv[1] == "--check-token":
+        try:
+            read_token_file(_token_path())
+            return 0
+        except (OSError, ValueError):
+            return 1
+    if argv[1] == "--status":
+        return run_status(_state_path(), _token_path())
+    if argv[1] == "--discard-pool":
+        return run_discard_pool(_state_path(), _token_path())
+    if argv[1] == EXTENSION_ORIGIN:
+        try:
+            return NativeHost(_state_path(), _token_path()).run()
+        except (OSError, ValueError) as error:
+            print(f"playwright-mcp-native-bridge: {error}", file=sys.stderr)
+            return 1
+    return run_client(argv[1], _state_path(), _token_path())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

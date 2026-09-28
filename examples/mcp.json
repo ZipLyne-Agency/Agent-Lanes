@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "browser": {
+      "command": "/Users/you/.local/bin/browser-mcp-server",
+      "args": ["playwright"]
+    },
+    "browser-isolated": {
+      "command": "/Users/you/.local/bin/browser-mcp-server",
+      "args": ["playwright-isolated"]
+    }
+  }
+}

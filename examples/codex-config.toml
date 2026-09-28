@@ -1,0 +1,9 @@
+# Add to ~/.codex/config.toml. Replace /Users/you with your home directory.
+
+[mcp_servers.browser]
+command = "/Users/you/.local/bin/browser-mcp-server"
+args = ["playwright"]
+
+[mcp_servers.browser-isolated]
+command = "/Users/you/.local/bin/browser-mcp-server"
+args = ["playwright-isolated"]

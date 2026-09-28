@@ -1,0 +1,20 @@
+{
+  "name": "agent-lanes-extension",
+  "version": "0.5.1",
+  "private": true,
+  "scripts": {
+    "build": "rm -rf -- out && vite build --clearScreen=false",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.ui.json"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.2.0",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "typescript": "6.0.3",
+    "vite": "8.1.0",
+    "vite-plugin-static-copy": "3.4.0"
+  }
+}

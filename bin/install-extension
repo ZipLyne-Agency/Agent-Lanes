@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Install the built Agent Lanes extension atomically and pin it.
+
+`npm run build` writes the extension to `extension/out/`. Chrome loads the
+installed copy (default `~/.local/share/agent-lanes/extension`). This
+script is the only thing that copies one into the other, and it does two more things the
+launcher (`browser-mcp-server`) relies on:
+
+1. Writes `<dest>/.install-manifest.json` with a SHA-256 for every installed file, so
+   a partial or tampered install is detected at every launcher start.
+2. Writes an owner-only (mode 0600) pin file *outside* the install that records the
+   manifest's own hash, the exact dest path, and the version. The manifest sits
+   beside the files it attests, so trusting it alone would let a stray build edit a
+   file and rewrite the manifest to match; the pin is the anchor.
+
+Atomicity and safety:
+- A lock beside the pin file (`<pin>.lock`, flock) serialises concurrent installs
+  that share a pin, and staging/backup directories get unique names, so two
+  installs can never delete each other's staged tree or backup mid-swap.
+- The new tree is staged next to dest, the old dest is moved aside, the stage is
+  renamed into place. If a rename fails the original dest is restored exactly.
+- The old dest is retained until the pin is written; if the pin write fails the
+  swap is reverted, so the install and its pin never disagree.
+- The pin is written relative to a directory descriptor opened with O_NOFOLLOW and
+  the file itself with O_NOFOLLOW, so neither the pin's parent directory nor the
+  pin filename may be a symlink. (Ancestor symlinks such as macOS's /var ->
+  /private/var are not rejected; they are not attacker-controlled.)
+
+The contract is exercised by tests/test_install_extension.py.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+# This file lives at <repo>/bin/, so the repo root is one level up.
+REPO = Path(__file__).resolve().parents[1]
+DEFAULT_SOURCE = REPO / "extension/out"
+DEFAULT_DEST = Path.home() / ".local/share/agent-lanes/extension"
+DEFAULT_PIN_FILE = Path.home() / ".config" / "agent-lanes/extension-pin.json"
+MANIFEST_NAME = ".install-manifest.json"
+PIN_ENV = "PLAYWRIGHT_MCP_CANARY_PIN_FILE"
+
+
+class InstallError(RuntimeError):
+    """A refusal with a message meant for stderr."""
+
+
+def pin_file_path() -> Path:
+    override = os.environ.get(PIN_ENV)
+    return Path(override).expanduser() if override else DEFAULT_PIN_FILE
+
+
+def read_version(source: Path) -> str:
+    manifest = source / "manifest.json"
+    if not source.is_dir() or not manifest.is_file():
+        raise InstallError(
+            f"refusing to install: {manifest} is missing; run `npm run build` first"
+        )
+    try:
+        version = json.loads(manifest.read_text())["version"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise InstallError(f"refusing to install: {manifest} has no readable version ({error})")
+    if not isinstance(version, str) or not version:
+        raise InstallError(f"refusing to install: {manifest} version is not a string")
+    return version
+
+
+def hash_tree(root: Path) -> dict[str, str]:
+    """SHA-256 of every regular file under root, keyed by posix-relative path.
+
+    The manifest never hashes itself.
+    """
+    files: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative == MANIFEST_NAME:
+            continue
+        files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return files
+
+
+def _remove_tree(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+class _InstallLock:
+    """flock on <pin>.lock, held for the whole install including the pin write.
+
+    Lives beside the pin (outside the repository tree) rather than beside dist/,
+    so it never shows up as an untracked file in the extension checkout.
+    """
+
+    def __init__(self, pin_file: Path):
+        self.path = pin_file.parent / f"{pin_file.name}.lock"
+        self.fd: int | None = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+
+
+def atomic_install(source: Path, dest: Path, keep_previous: bool = False):
+    """Stage source next to dest, write the manifest, and swap atomically.
+
+    Returns (version, manifest_bytes, previous) where previous is the moved-aside
+    old dest (or None) when keep_previous is True, so the caller can revert the
+    swap if a later step (the pin write) fails. With keep_previous False the old
+    dest is removed before returning. On any rename failure the original dest is
+    restored byte-for-byte and no staging directories remain.
+    """
+    source = Path(source)
+    dest = Path(dest)
+    version = read_version(source)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Unique per-run staging and backup names: a concurrent install (or a crashed
+    # earlier one) can never collide with ours. Prefix keeps them recognisable.
+    stage = Path(tempfile.mkdtemp(prefix=f"{dest.name}.next.", dir=dest.parent))
+    previous = Path(tempfile.mkdtemp(prefix=f"{dest.name}.prev.", dir=dest.parent))
+    previous.rmdir()  # reserve the unique name; rename() needs it absent
+    stage.rmdir()
+
+    shutil.copytree(source, stage, symlinks=False)
+    manifest = {"version": version, "files": hash_tree(stage)}
+    manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    (stage / MANIFEST_NAME).write_bytes(manifest_bytes)
+
+    moved_aside = False
+    try:
+        if dest.exists() or dest.is_symlink():
+            dest.rename(previous)
+            moved_aside = True
+        stage.rename(dest)
+    except BaseException:
+        if moved_aside and previous.exists() and not dest.exists():
+            previous.rename(dest)
+        _remove_tree(stage)
+        raise
+    if keep_previous:
+        return version, manifest_bytes, (previous if moved_aside else None)
+    _remove_tree(previous)
+    return version, manifest_bytes, None
+
+
+def revert_install(dest: Path, previous: Path | None) -> None:
+    """Undo a swap whose follow-up (the pin) failed: put the old dest back."""
+    dest = Path(dest)
+    discard = Path(tempfile.mkdtemp(prefix=f"{dest.name}.failed.", dir=dest.parent))
+    discard.rmdir()
+    if dest.exists() or dest.is_symlink():
+        dest.rename(discard)
+    if previous is not None and previous.exists():
+        previous.rename(dest)
+    _remove_tree(discard)
+
+
+def write_pin_file(pin_file: Path, version: str, dest: Path, manifest_bytes: bytes) -> None:
+    """Write the owner-only pin atomically, never through a symlink.
+
+    The parent directory is opened O_NOFOLLOW|O_DIRECTORY and every file operation
+    is relative to that descriptor with O_NOFOLLOW, so a symlinked parent or a
+    symlinked pin filename is refused rather than followed.
+    """
+    pin_file = Path(pin_file)
+    if pin_file.is_symlink():
+        raise InstallError(
+            f"refusing to write pin: {pin_file} is a symlink; remove it and re-run"
+        )
+    parent = pin_file.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        raise InstallError(
+            f"refusing to write pin: {parent} is a symlink; use a real directory"
+        )
+    try:
+        dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise InstallError(f"refusing to write pin: cannot open {parent} safely ({error})")
+    payload = (
+        json.dumps(
+            {
+                "version": version,
+                "dest": str(Path(dest).resolve()),
+                "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    tmp_name = f".{pin_file.name}.{os.getpid()}.tmp"
+    try:
+        fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=dfd,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            handle = os.fdopen(fd, "w")  # takes ownership of fd from here on
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
+            handle.write(payload)
+        os.replace(tmp_name, pin_file.name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.chmod(pin_file.name, 0o600, dir_fd=dfd, follow_symlinks=False)
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(dfd)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE, help="built extension (extension/out)")
+    parser.add_argument("--dest", type=Path, default=DEFAULT_DEST, help="directory Chrome loads unpacked")
+    args = parser.parse_args(argv)
+
+    pin_file = pin_file_path()
+    try:
+        # Validate the pin target before touching dest so a bad pin path never
+        # leaves a freshly installed dist that the launcher will then reject.
+        if pin_file.is_symlink() or pin_file.parent.is_symlink():
+            raise InstallError(
+                f"refusing to write pin: {pin_file} or its directory is a symlink; remove it and re-run"
+            )
+        with _InstallLock(pin_file):
+            version, manifest_bytes, previous = atomic_install(
+                args.source, args.dest, keep_previous=True
+            )
+            try:
+                write_pin_file(pin_file, version, args.dest, manifest_bytes)
+            except BaseException:
+                # dist must never be newer than its pin: put the old dest back.
+                revert_install(args.dest, previous)
+                raise
+            if previous is not None:
+                _remove_tree(previous)
+    except InstallError as error:
+        print(f"install-extension: {error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"install-extension: {error}; previous install restored", file=sys.stderr)
+        return 1
+    print(
+        f"Installed Agent Lanes extension {version} into {Path(args.dest).resolve()} "
+        f"({len(json.loads(manifest_bytes)['files'])} files hashed); pin written to {pin_file}"
+    )
+    print("Reload the unpacked extension on chrome://extensions to load it; a Chrome restart alone does not.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

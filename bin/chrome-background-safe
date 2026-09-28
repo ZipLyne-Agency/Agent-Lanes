@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Launch and verify the user's regular Chrome with background occlusion disabled."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+
+
+CHROME_APP = "/Applications/Google Chrome.app"
+CHROME_BINARY = f"{CHROME_APP}/Contents/MacOS/Google Chrome"
+REQUIRED_SWITCH = "--disable-backgrounding-occluded-windows"
+DEFAULT_USER_DATA_DIR = "~/Library/Application Support/Google/Chrome"
+
+
+def _arguments(command: str) -> list[str] | None:
+    if command == CHROME_BINARY:
+        return []
+    prefix = f"{CHROME_BINARY} "
+    if not command.startswith(prefix):
+        return None
+    return command[len(prefix):].split()
+
+
+def is_regular_chrome(command: str) -> bool:
+    arguments = _arguments(command)
+    if arguments is None:
+        return False
+    disallowed_prefixes = (
+        "--headless",
+        "--remote-debugging-pipe",
+        "--remote-debugging-port",
+        "--test-type",
+        "--enable-automation",
+        "--type=",
+        "--user-data-dir",
+    )
+    return not any(argument.startswith(disallowed_prefixes) for argument in arguments)
+
+
+def is_background_safe_regular_chrome(command: str) -> bool:
+    arguments = _arguments(command)
+    return is_regular_chrome(command) and REQUIRED_SWITCH in (arguments or [])
+
+
+def _default_user_data_dir_real() -> str:
+    return os.path.realpath(os.path.expanduser(DEFAULT_USER_DATA_DIR))
+
+
+def _user_data_dir_value(arguments: list[str]) -> str | None:
+    for index, argument in enumerate(arguments):
+        if argument.startswith("--user-data-dir="):
+            return argument.split("=", 1)[1]
+        if argument == "--user-data-dir":
+            return arguments[index + 1] if index + 1 < len(arguments) else ""
+        if argument.startswith("--user-data-dir"):
+            # Malformed/opaque form, e.g. "--user-data-dirXYZ"; there is no
+            # clean value to resolve, so treat it as non-default (foreign).
+            return argument[len("--user-data-dir"):]
+    return None
+
+
+def is_foreign_profile_chrome(command: str) -> bool:
+    """A Chrome main process running against a different profile, e.g. a
+    headless copied-profile automation instance. It can never collide with
+    the user's Default-profile authenticated Chrome, so it is ignored by the
+    background-safety check rather than counted as an ambiguous instance.
+
+    A --user-data-dir that resolves (after expanding ~ and symlinks) to the
+    real default user-data directory is NOT foreign: it counts as a regular-
+    profile Chrome for the ambiguity check, so a debug/headless Chrome
+    explicitly pointed at the default directory still fails the check and
+    refuses launch. In practice Chrome's own profile lock (SingletonLock)
+    prevents a second process from actually running against the default
+    user-data directory at the same time, so this case is mostly defensive."""
+    arguments = _arguments(command)
+    if arguments is None:
+        return False
+    value = _user_data_dir_value(arguments)
+    if value is None:
+        return False
+    if not value:
+        return True
+    resolved = os.path.realpath(os.path.expanduser(value))
+    return resolved != _default_user_data_dir_real()
+
+
+def _process_commands() -> list[str]:
+    result = subprocess.run(
+        ["/bin/ps", "xww", "-o", "command="],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def commands_are_background_safe(commands: list[str]) -> bool:
+    # Foreign-profile Chrome instances (--user-data-dir, e.g. a headless
+    # copied-profile automation Chrome) can't collide with the Default
+    # profile, so they're excluded before counting ambiguity.
+    relevant = [
+        command
+        for command in commands
+        if _arguments(command) is not None and not is_foreign_profile_chrome(command)
+    ]
+    regular = [command for command in relevant if is_regular_chrome(command)]
+    return len(relevant) == 1 and len(regular) == 1 and is_background_safe_regular_chrome(regular[0])
+
+
+def launch_decision(commands: list[str]) -> str:
+    relevant = [
+        command
+        for command in commands
+        if _arguments(command) is not None and not is_foreign_profile_chrome(command)
+    ]
+    regular = [command for command in relevant if is_regular_chrome(command)]
+    if len(relevant) != len(regular):
+        return "refuse"
+    if not regular:
+        return "start"
+    if len(regular) == 1 and is_background_safe_regular_chrome(regular[0]):
+        return "activate"
+    return "refuse"
+
+
+def check() -> bool:
+    return commands_are_background_safe(_process_commands())
+
+
+def launch() -> int:
+    decision = launch_decision(_process_commands())
+    if decision == "refuse":
+        return 1
+    command = ["/usr/bin/open", "-a", CHROME_APP]
+    if decision == "start":
+        # Isolated Playwright is pinned to its own headless-shell executable, so
+        # no unrelated process shares regular Chrome's bundle identity. Launch
+        # the canonical LaunchServices instance: `open -n` accepts the initial
+        # launch but later external URL events are delivered to throwaway Chrome
+        # instances instead of this authenticated profile.
+        command.extend(["--args", REQUIRED_SWITCH])
+    subprocess.run(command, check=True, timeout=10)
+
+    if decision == "activate":
+        return 0
+
+    # `open` returns before Chrome finishes registering its main process.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if check():
+            return 0
+        time.sleep(0.1)
+    return 1
+
+
+def main(argv: list[str]) -> int:
+    if argv == ["--check"]:
+        return 0 if check() else 1
+    if argv == ["--status"]:
+        print("ready" if check() else "not-ready")
+        return 0 if check() else 1
+    if argv == ["--launch"]:
+        return launch()
+    print("usage: chrome-background-safe <--check|--status|--launch>", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

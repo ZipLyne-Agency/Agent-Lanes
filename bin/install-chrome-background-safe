@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Install the Google Chrome (Agent Safe) launcher app without restarting Chrome.
+
+With --dock (via scripts/install.sh --dock) it also replaces Chrome's Dock tile
+with the launcher, and --dock-mode swaps the tile between the launcher (Chrome
+closed) and the real Chrome bundle (Chrome running) so the Dock shows one icon.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import plistlib
+import secrets
+import shutil
+import signal
+import subprocess
+import tempfile
+from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
+
+
+CHROME_BUNDLE_ID = "com.google.Chrome"
+SAFE_BUNDLE_ID = "agency.ziplyne.ChromeAgentSafe"
+# Dock tiles of other browsers this installer may remove. Empty on purpose: the
+# public installer never touches any tile but Chrome's own.
+RETIRED_BROWSER_BUNDLE_IDS: set[str] = set()
+CHROME_APP = Path("/Applications/Google Chrome.app")
+SAFE_APP_NAME = "Google Chrome (Agent Safe).app"
+DOCK_COMMAND = "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
+SWIFT_PREFERENCES = r'''
+import CoreFoundation
+import Foundation
+
+let key = "persistent-apps" as CFString
+let domain = "com.apple.dock" as CFString
+
+func fail(_ message: String) -> Never {
+  FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+  exit(2)
+}
+
+guard CommandLine.arguments.count == 2 else { fail("expected read or write") }
+switch CommandLine.arguments[1] {
+case "read":
+  guard let value = CFPreferencesCopyAppValue(key, domain) else {
+    fail("Dock persistent-apps preference is missing")
+  }
+  do {
+    let data = try PropertyListSerialization.data(
+      fromPropertyList: value,
+      format: .binary,
+      options: 0
+    )
+    FileHandle.standardOutput.write(data)
+  } catch {
+    fail("could not serialize Dock persistent-apps")
+  }
+case "write":
+  let data = FileHandle.standardInput.readDataToEndOfFile()
+  do {
+    let value = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+    guard value is [Any] else { fail("Dock persistent-apps was not an array") }
+    CFPreferencesSetAppValue(key, value as CFPropertyList, domain)
+    guard CFPreferencesAppSynchronize(domain) else {
+      fail("could not synchronize Dock persistent-apps")
+    }
+  } catch {
+    fail("could not parse Dock persistent-apps")
+  }
+default:
+  fail("expected read or write")
+}
+'''
+
+
+def _safe_tile(source: dict, app_url: str) -> dict:
+    tile = dict(source)
+    tile["GUID"] = tile.get("GUID", secrets.randbits(32))
+    tile["tile-type"] = "file-tile"
+    data = dict(tile.get("tile-data", {}))
+    data.pop("book", None)
+    data.pop("file-mod-date", None)
+    data.pop("parent-mod-date", None)
+    data.update({
+        "bundle-identifier": SAFE_BUNDLE_ID,
+        "dock-extra": 0,
+        "file-data": {"_CFURLString": app_url, "_CFURLStringType": 15},
+        "file-label": "Google Chrome",
+        "file-type": 41,
+    })
+    tile["tile-data"] = data
+    return tile
+
+
+def _regular_tile(source: dict) -> dict:
+    tile = _safe_tile(source, "file:///Applications/Google%20Chrome.app/")
+    tile["tile-data"]["bundle-identifier"] = CHROME_BUNDLE_ID
+    return tile
+
+
+def _same_file_url(left: object, right: str) -> bool:
+    if not isinstance(left, str):
+        return False
+    try:
+        left_url = urlsplit(left)
+        right_url = urlsplit(right)
+    except ValueError:
+        return False
+    if left_url.scheme != "file" or right_url.scheme != "file" or left_url.netloc or right_url.netloc:
+        return False
+    return Path(unquote(left_url.path)).resolve() == Path(unquote(right_url.path)).resolve()
+
+
+def replace_chrome_dock_item(dock: dict, app_url: str) -> bool:
+    apps = dock.setdefault("persistent-apps", [])
+    safe_matching = [
+        index for index, item in enumerate(apps)
+        if item.get("tile-data", {}).get("bundle-identifier") == SAFE_BUNDLE_ID
+    ]
+    chrome_matching = [
+        index for index, item in enumerate(apps)
+        if item.get("tile-data", {}).get("bundle-identifier") == CHROME_BUNDLE_ID
+    ]
+    # A failed running/launcher transition can leave two pinned regular Chrome
+    # tiles. Recover only when both unambiguously target the canonical app: keep
+    # the earlier Dock position, convert it to the safe launcher, and remove the
+    # later duplicate. Different targets remain ambiguous and fail closed.
+    if len(safe_matching) == 0 and len(chrome_matching) == 2:
+        regular_url = "file:///Applications/Google%20Chrome.app/"
+        if not all(_same_file_url(
+            apps[index].get("tile-data", {}).get("file-data", {}).get("_CFURLString"),
+            regular_url,
+        ) for index in chrome_matching):
+            raise RuntimeError("ambiguous Chrome Dock state; duplicate regular launchers differ")
+        keep_index, remove_index = chrome_matching
+        dock["persistent-apps"] = [
+            _safe_tile(item, app_url) if index == keep_index else item
+            for index, item in enumerate(apps)
+            if index != remove_index
+        ]
+        return True
+    # macOS can re-add the regular Chrome tile after a browser restart even when
+    # the safe launcher is already pinned. This exact one-safe/one-regular state
+    # is deterministic: retain the existing safe tile and remove only the duplicate
+    # regular tile. Any wider ambiguity still fails closed.
+    if len(safe_matching) == 1 and len(chrome_matching) == 1:
+        safe_index = safe_matching[0]
+        safe_data = apps[safe_index].get("tile-data", {})
+        if not _same_file_url(safe_data.get("file-data", {}).get("_CFURLString"), app_url):
+            raise RuntimeError("ambiguous Chrome Dock state; safe launcher points elsewhere")
+        replacement = _safe_tile(apps[safe_index], app_url)
+        dock["persistent-apps"] = [
+            replacement if index == safe_index else item
+            for index, item in enumerate(apps)
+            if index != chrome_matching[0]
+        ]
+        return dock["persistent-apps"] != apps
+
+    matching = safe_matching + chrome_matching
+    if len(matching) != 1:
+        raise RuntimeError("ambiguous Chrome Dock state; expected exactly one Chrome launcher")
+    index = matching[0]
+    data = apps[index].get("tile-data", {})
+    if data.get("bundle-identifier") == SAFE_BUNDLE_ID:
+        current_url = data.get("file-data", {}).get("_CFURLString")
+        if not _same_file_url(current_url, app_url):
+            raise RuntimeError("ambiguous Chrome Dock state; safe launcher points elsewhere")
+    replacement = _safe_tile(apps[index], app_url)
+    new_apps = list(apps)
+    new_apps[index] = replacement
+    changed = new_apps != apps
+    dock["persistent-apps"] = new_apps
+    return changed
+
+
+def remove_retired_browser_tiles(apps: list[dict]) -> list[dict]:
+    """Remove only the explicitly retired Dev/Testing launchers from the Dock."""
+    return [
+        item for item in apps
+        if item.get("tile-data", {}).get("bundle-identifier")
+        not in RETIRED_BROWSER_BUNDLE_IDS
+    ]
+
+
+def replace_safe_dock_item_with_regular(dock: dict) -> bool:
+    apps = dock.setdefault("persistent-apps", [])
+    safe = [i for i, item in enumerate(apps) if item.get("tile-data", {}).get("bundle-identifier") == SAFE_BUNDLE_ID]
+    regular = [i for i, item in enumerate(apps) if item.get("tile-data", {}).get("bundle-identifier") == CHROME_BUNDLE_ID]
+    if len(safe) == 0 and len(regular) == 1:
+        return False
+    if len(safe) == 0 and len(regular) == 2:
+        regular_url = "file:///Applications/Google%20Chrome.app/"
+        if not all(_same_file_url(
+            apps[index].get("tile-data", {}).get("file-data", {}).get("_CFURLString"),
+            regular_url,
+        ) for index in regular):
+            raise RuntimeError("ambiguous Chrome Dock state while showing running Chrome")
+        dock["persistent-apps"] = [
+            item for index, item in enumerate(apps) if index != regular[1]
+        ]
+        return True
+    if len(safe) != 1 or len(regular) > 1:
+        raise RuntimeError("ambiguous Chrome Dock state while showing running Chrome")
+    safe_index = safe[0]
+    replacement = _regular_tile(apps[safe_index])
+    dock["persistent-apps"] = [
+        replacement if index == safe_index else item
+        for index, item in enumerate(apps)
+        if index not in regular
+    ]
+    return True
+
+
+def _copy_app(source_contents: Path, destination: Path, backup_root: Path) -> None:
+    if destination.is_symlink():
+        raise RuntimeError(f"refusing symlinked launcher destination: {destination}")
+    if destination.exists():
+        backup = backup_root / destination.relative_to(Path.home())
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        if backup.exists():
+            shutil.rmtree(backup)
+        shutil.copytree(destination, backup, symlinks=True)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".chrome-agent-safe.", dir=destination.parent))
+    try:
+        contents = staging / "Contents"
+        shutil.copytree(source_contents, contents)
+        resources = contents / "Resources"
+        resources.mkdir(parents=True, exist_ok=True)
+        chrome_icon = CHROME_APP / "Contents/Resources/app.icns"
+        if chrome_icon.is_file():
+            shutil.copy2(chrome_icon, resources / "app.icns")
+        executable = contents / "MacOS/Google Chrome Agent Safe"
+        executable.chmod(0o755)
+        if destination.exists():
+            shutil.rmtree(destination)
+        staging.rename(destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+    try:
+        subprocess.run(
+            ["/usr/bin/codesign", "--deep", "--force", "--sign", "-", str(destination)],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(destination)],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        installed_icon = destination / "Contents/Resources/app.icns"
+        chrome_icon = CHROME_APP / "Contents/Resources/app.icns"
+        if chrome_icon.is_file() and installed_icon.read_bytes() != chrome_icon.read_bytes():
+            raise RuntimeError("installed safe launcher icon differs from Chrome")
+    except Exception:
+        if destination.exists():
+            shutil.rmtree(destination)
+        backup = backup_root / destination.relative_to(Path.home())
+        if backup.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(backup, destination, symlinks=True)
+        raise
+
+
+def _dock_pid() -> int | None:
+    result = subprocess.run(
+        ["/bin/ps", "xww", "-o", "pid=,command="],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    matches = []
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) == 2 and fields[1] == DOCK_COMMAND:
+            matches.append(int(fields[0]))
+    if len(matches) > 1:
+        raise RuntimeError("multiple Dock processes matched exact ownership check")
+    return matches[0] if matches else None
+
+
+def _read_persistent_apps() -> list[dict]:
+    result = subprocess.run(
+        ["/usr/bin/swift", "-e", SWIFT_PREFERENCES, "read"],
+        check=True,
+        capture_output=True,
+        timeout=20,
+    )
+    value = plistlib.loads(result.stdout)
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise RuntimeError("Dock persistent-apps preference was malformed")
+    return value
+
+
+def _write_persistent_apps(apps: list[dict]) -> None:
+    subprocess.run(
+        ["/usr/bin/swift", "-e", SWIFT_PREFERENCES, "write"],
+        input=plistlib.dumps(apps, fmt=plistlib.FMT_BINARY, sort_keys=False),
+        check=True,
+        capture_output=True,
+        timeout=20,
+    )
+
+
+def sync_dock_mode(mode: str) -> bool:
+    original_apps = _read_persistent_apps()
+    apps = remove_retired_browser_tiles(original_apps)
+    dock = {"persistent-apps": apps}
+    if mode == "running":
+        changed = replace_safe_dock_item_with_regular(dock)
+        expected = CHROME_BUNDLE_ID
+    else:
+        destination = Path.home() / "Applications" / SAFE_APP_NAME
+        changed = replace_chrome_dock_item(dock, "file://" + quote(str(destination)) + "/")
+        expected = SAFE_BUNDLE_ID
+    changed = changed or len(apps) != len(original_apps)
+    if not changed:
+        return False
+    try:
+        _write_persistent_apps(dock["persistent-apps"])
+        readback = _read_persistent_apps()
+        managed = [
+            item.get("tile-data", {}).get("bundle-identifier")
+            for item in readback
+            if item.get("tile-data", {}).get("bundle-identifier") in {
+                SAFE_BUNDLE_ID, CHROME_BUNDLE_ID, *RETIRED_BROWSER_BUNDLE_IDS,
+            }
+        ]
+        if managed != [expected]:
+            raise RuntimeError("Dock Chrome launcher transition did not verify")
+    except Exception:
+        _write_persistent_apps(original_apps)
+        raise
+    dock_pid = _dock_pid()
+    if dock_pid is not None:
+        os.kill(dock_pid, signal.SIGTERM)
+    return True
+
+
+def _replace_dock(destination: Path, backup_root: Path) -> bool:
+    original_apps = _read_persistent_apps()
+    managed_apps = remove_retired_browser_tiles(original_apps)
+    dock = {"persistent-apps": managed_apps}
+    app_url = "file://" + quote(str(destination)) + "/"
+    retired_changed = len(managed_apps) != len(original_apps)
+    launcher_changed = replace_chrome_dock_item(dock, app_url)
+    if not retired_changed and not launcher_changed:
+        return False
+    original_safe_indices = [
+        index for index, item in enumerate(managed_apps)
+        if item.get("tile-data", {}).get("bundle-identifier") == SAFE_BUNDLE_ID
+    ]
+    original_chrome_indices = [
+        index for index, item in enumerate(managed_apps)
+        if item.get("tile-data", {}).get("bundle-identifier") == CHROME_BUNDLE_ID
+    ]
+    preserved_index = original_safe_indices[0] if len(original_safe_indices) == 1 else original_chrome_indices[0]
+    removed_before = (
+        1 if len(original_safe_indices) == 1 and len(original_chrome_indices) == 1 and
+        original_chrome_indices[0] < preserved_index else 0
+    )
+    expected_index = preserved_index - removed_before
+    original_guid = managed_apps[preserved_index].get("GUID")
+    backup = backup_root / "Library/Preferences/com.apple.dock.persistent-apps.plist"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    backup.write_bytes(plistlib.dumps(original_apps, fmt=plistlib.FMT_BINARY, sort_keys=False))
+    try:
+        _write_persistent_apps(dock["persistent-apps"])
+        readback = _read_persistent_apps()
+        safe_items = [
+            (index, item) for index, item in enumerate(readback)
+            if item.get("tile-data", {}).get("bundle-identifier") == SAFE_BUNDLE_ID
+        ]
+        chrome_items = [
+            item for item in readback
+            if item.get("tile-data", {}).get("bundle-identifier") == CHROME_BUNDLE_ID
+        ]
+        retired_items = [
+            item for item in readback
+            if item.get("tile-data", {}).get("bundle-identifier")
+            in RETIRED_BROWSER_BUNDLE_IDS
+        ]
+        if len(safe_items) != 1 or chrome_items or \
+                retired_items or \
+                safe_items[0][0] != expected_index or safe_items[0][1].get("GUID") != original_guid or \
+                not _same_file_url(
+                    safe_items[0][1].get("tile-data", {}).get("file-data", {}).get("_CFURLString"),
+                    app_url,
+                ):
+            raise RuntimeError("Dock did not retain the background-safe Chrome launcher")
+    except Exception:
+        _write_persistent_apps(original_apps)
+        raise
+    dock_pid = _dock_pid()
+    if dock_pid is not None:
+        os.kill(dock_pid, signal.SIGTERM)
+    return True
+
+
+def install(source_contents: Path, backup_root: Path, preserve_running_chrome: bool = False, manage_dock: bool = True) -> Path:
+    if not CHROME_APP.is_dir():
+        raise RuntimeError(f"Google Chrome is not installed at {CHROME_APP}")
+    destination = Path.home() / "Applications" / SAFE_APP_NAME
+    _copy_app(source_contents, destination, backup_root)
+    if not manage_dock:
+        return destination
+    if preserve_running_chrome:
+        # The invisible launcher already swapped its tile to the real running
+        # Chrome bundle. Keep that exact one-icon state during an update instead
+        # of flipping the Dock twice while Chrome remains open.
+        sync_dock_mode("running")
+    else:
+        _replace_dock(destination, backup_root)
+    return destination
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source-contents", type=Path)
+    parser.add_argument("--backup-root", type=Path)
+    parser.add_argument("--dock-mode", choices=("running", "launcher"))
+    parser.add_argument("--preserve-running-chrome", action="store_true")
+    parser.add_argument("--dock", action="store_true", help="also replace Chrome's Dock tile with the launcher")
+    args = parser.parse_args()
+    if args.dock_mode:
+        sync_dock_mode(args.dock_mode)
+        return 0
+    if args.source_contents is None or args.backup_root is None:
+        parser.error("--source-contents and --backup-root are required for installation")
+    destination = install(
+        args.source_contents.resolve(),
+        args.backup_root.resolve(),
+        preserve_running_chrome=args.preserve_running_chrome,
+        manage_dock=args.dock,
+    )
+    print(destination)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

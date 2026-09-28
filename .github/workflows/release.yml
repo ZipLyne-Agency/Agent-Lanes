@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build the extension and publish the release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Build
+        run: |
+          npm --prefix extension ci --no-audit --no-fund
+          npm --prefix extension run typecheck
+          npm --prefix extension run build
+
+      - name: Check the tag matches the extension version
+        run: |
+          version="$(node -p "require('./extension/manifest.json').version")"
+          test "v$version" = "$GITHUB_REF_NAME"
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          (cd extension/out && zip -qr "$GITHUB_WORKSPACE/agent-lanes-extension-$version.zip" .)
+          shasum -a 256 "agent-lanes-extension-$version.zip" > "agent-lanes-extension-$version.zip.sha256"
+          awk -v v="## $version " 'index($0, v) == 1 {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > release-notes.md
+          cat >> release-notes.md <<'NOTES'
+
+          ### Download
+
+          `agent-lanes-extension-*.zip` is the built extension. It is one piece of the system: clone the repository and run `scripts/install.sh`, which installs the extension together with the native bridge, the launcher app, and the display helper. See docs/install.md.
+          NOTES
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            "agent-lanes-extension-$version.zip" \
+            "agent-lanes-extension-$version.zip.sha256" \
+            --title "Agent Lanes for Chrome $version" \
+            --notes-file release-notes.md

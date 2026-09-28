@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Test-only portable stand-in for macOS shlock(1).
+set -euo pipefail
+
+pid=""
+lock_file=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p) pid="${2:-}"; shift 2 ;;
+    -f) lock_file="${2:-}"; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+
+[ -n "$pid" ] && [ -n "$lock_file" ] || exit 2
+mkdir -p "$(dirname "$lock_file")"
+
+for _ in 1 2 3; do
+  if (set -o noclobber; printf '%s\n' "$pid" > "$lock_file") 2>/dev/null; then
+    exit 0
+  fi
+
+  owner="$(cat "$lock_file" 2>/dev/null || true)"
+  # An empty file is a contender between atomic creation and its first write.
+  [ -n "$owner" ] || exit 1
+  kill -0 "$owner" 2>/dev/null && exit 1
+  rm -f -- "$lock_file"
+done
+
+exit 1

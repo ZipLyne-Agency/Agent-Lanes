@@ -1,0 +1,9 @@
+{
+  "name": "agency.ziplyne.agent_lanes",
+  "description": "Local authenticated Playwright MCP bridge",
+  "path": "__HOME__/.local/bin/playwright-mcp-native-bridge",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/"
+  ]
+}
