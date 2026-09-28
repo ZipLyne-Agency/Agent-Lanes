@@ -187,8 +187,13 @@ unit suite asserts it.
 
 - A debugger `Page.navigate` to `about:blank#<fragment>` crashed Chrome 154 once
   during development. Not investigated further. Agents should not do it.
-- Cmd-\` can land on a hidden lane; the guard hands focus back, so cycling Chrome's
-  windows with Cmd-\` may bounce back to the last window you used.
+- Cmd-\` can land on a hidden lane; the guard hands focus to your window on the same
+  Space, so cycling Chrome's windows with Cmd-\` may skip back to it.
+- On a Space (desktop) that holds lanes but none of your Chrome windows, switching
+  there with Chrome active leaves focus on an invisible lane until you click another
+  app. Keystrokes in that moment go to the lane's active tab (its inert anchor page
+  unless an agent command is running). Chrome does not tell extensions which Space a
+  window is on, so this is the cost of never switching Spaces for you.
 - The rejected `window.open`-with-features path briefly shows a window before the
   guard removes it.
 - Not yet run live: clicking Chrome's Dock icon while only lanes are open, sleep and

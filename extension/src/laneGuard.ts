@@ -16,7 +16,7 @@
 
 import { userWindowBounds } from './agentDisplay';
 import { debugLog } from './relayConnection';
-import { isBackgroundedLaneWindow } from './workspaceLifecycle';
+import { isBackgroundedLaneWindow, isLaneWindowInService } from './workspaceLifecycle';
 
 // A lane focus event this soon after an eviction is Chrome finishing the
 // external-link hand-off we just reversed, not the user reclaiming the lane.
@@ -40,6 +40,11 @@ export type LaneGuardDeps = {
   // Cmd-`, the Window menu), never the user taking the lane over. Absent means
   // visible, which keeps the original reclaim-on-focus behaviour.
   isHidden?: () => Promise<boolean>;
+  // The user's most recent window on the macOS Space (desktop) that is showing
+  // right now, or undefined when none is known. Focusing a window on another
+  // Space makes macOS switch to that Space, so a hidden lane hands focus back
+  // only to a window on the current one.
+  userWindowOnCurrentSpace?: () => Promise<number | undefined>;
 };
 
 // Watches one lane window for the two things that must never quietly happen to
@@ -85,8 +90,13 @@ export class LaneGuard {
         void this._onLaneFocused();
     };
     const onBoundsChanged = (window: chrome.windows.Window) => {
-      if (window.id === this._windowId && !isBackgroundedLaneWindow(window))
-        this._reclaim(`Agent lane was reclaimed (type=${window.type};state=${window.state};focused=${Boolean(window.focused)})`);
+      if (window.id !== this._windowId || isBackgroundedLaneWindow(window))
+        return;
+      // A hidden lane that macOS focused moves (placement) without being reclaimed.
+      void isLaneWindowInService(window).then(inService => {
+        if (!inService)
+          this._reclaim(`Agent lane was reclaimed (type=${window.type};state=${window.state};focused=${Boolean(window.focused)})`);
+      });
     };
     chrome.tabs.onCreated.addListener(onCreated);
     chrome.tabs.onActivated.addListener(onActivated);
@@ -224,49 +234,83 @@ export class LaneGuard {
   }
 
   // A visible lane the user focuses is theirs. A hidden one cannot be, so its
-  // sessions keep running and the key window goes back where they can see it.
+  // sessions keep running and focus goes back to a window the user can see.
   // Chrome is already the active app here, so this moves focus between
   // Chrome's own windows and never takes it from another app.
   private async _reclaimOrHandBack(): Promise<void> {
     if (await (this._deps.isHidden?.() ?? Promise.resolve(false)).catch(() => false)) {
       this._lastHandBackAt = Date.now();
-      await this._returnFocusToUser(true);
+      await this._handBackFromHiddenLane();
       this._lastHandBackAt = Date.now();
-      debugLog(`Handed focus back from hidden lane ${this._windowId}`);
       return;
     }
     this._reclaim('Agent lane was reclaimed (state=unknown;focused=true)');
   }
 
-  private async _returnFocusToUser(openWhenMissing = false): Promise<void> {
+  // macOS focuses a hidden lane when the user switches to a Space where the lane
+  // is Chrome's frontmost window, or through Cmd-`, the Window menu, or the
+  // Dock icon. Focus goes to the user's window on the Space they are on. When
+  // no such window is known it stays where it is: focusing a window on another
+  // Space would drag the user to that Space, which is worse than an idle lane
+  // holding focus until they click elsewhere. Only when Chrome has no window of
+  // the user's at all is one opened, on the current Space.
+  private async _handBackFromHiddenLane(): Promise<void> {
+    const target = await (this._deps.userWindowOnCurrentSpace?.() ?? Promise.resolve(undefined)).catch(() => undefined);
+    if (target !== undefined) {
+      await chrome.windows.update(target, { focused: true }).catch(() => {});
+      debugLog(`Handed focus from hidden lane ${this._windowId} to window ${target} on the current Space`);
+      return;
+    }
+    const userWindows = (await chrome.windows.getAll({ windowTypes: ['normal'] }).catch(() => [] as chrome.windows.Window[]))
+        .filter(window => window.id !== undefined && !this._deps.isLaneWindow(window.id));
+    if (!userWindows.length) {
+      await chrome.windows.create({ focused: true, ...(await userWindowBounds() ?? {}) }).catch(() => {});
+      debugLog(`Opened a window for the user after hidden lane ${this._windowId} took focus`);
+      return;
+    }
+    debugLog(`Hidden lane ${this._windowId} keeps focus: no user window known on the current Space`);
+  }
+
+  // After an adopted page popup. Same Space rule as the hidden-lane hand-back.
+  private async _returnFocusToUser(): Promise<void> {
+    if (this._deps.userWindowOnCurrentSpace) {
+      const target = await this._deps.userWindowOnCurrentSpace().catch(() => undefined);
+      if (target !== undefined)
+        await chrome.windows.update(target, { focused: true }).catch(() => {});
+      return;
+    }
     const userWindowId = this._deps.lastUserWindowId();
     const userWindow = userWindowId === undefined || this._deps.isLaneWindow(userWindowId)
       ? undefined
       : await chrome.windows.get(userWindowId).catch(() => undefined);
-    if (userWindow?.id !== undefined && userWindow.type === 'normal') {
+    if (userWindow?.id !== undefined && userWindow.type === 'normal')
       await chrome.windows.update(userWindow.id, { focused: true }).catch(() => {});
-      return;
-    }
-    // Clicking Chrome's Dock icon with only lanes open shows no window at all,
-    // because Chrome counts the hidden lanes as visible. Give the user one.
-    if (openWhenMissing)
-      await chrome.windows.create({ focused: true, ...(await userWindowBounds() ?? {}) }).catch(() => {});
   }
 }
 
 // Remembers the user's most recently focused normal window that is not a lane,
-// so an evicted tab lands where the user actually works.
+// so an evicted tab lands where the user actually works, and the macOS Space
+// each of their windows was on when they last used it.
 export class UserWindowTracker {
   private _lastUserWindowId: number | undefined;
   private _listener: (windowId: number) => void;
+  // windowId -> the Space it was focused on, most recently used last.
+  private _spaceByWindow = new Map<number, number>();
 
-  constructor(private readonly _isLaneWindow: (windowId: number) => boolean) {
+  constructor(private readonly _isLaneWindow: (windowId: number) => boolean,
+    private readonly _activeSpace: () => Promise<number | undefined> = async () => undefined) {
     this._listener = windowId => {
       if (windowId === chrome.windows.WINDOW_ID_NONE || this._isLaneWindow(windowId))
         return;
-      void chrome.windows.get(windowId).then(window => {
-        if (window.type === 'normal' && !this._isLaneWindow(windowId))
-          this._lastUserWindowId = windowId;
+      void chrome.windows.get(windowId).then(async window => {
+        if (window.type !== 'normal' || this._isLaneWindow(windowId))
+          return;
+        this._lastUserWindowId = windowId;
+        const space = await this._activeSpace().catch(() => undefined);
+        if (space !== undefined) {
+          this._spaceByWindow.delete(windowId);
+          this._spaceByWindow.set(windowId, space);
+        }
       }).catch(() => {});
     };
     chrome.windows.onFocusChanged.addListener(this._listener);
@@ -280,10 +324,25 @@ export class UserWindowTracker {
     return this._lastUserWindowId;
   }
 
+  // The most recently used user window that was last focused on this Space
+  // and still exists, or undefined.
+  async lastUserWindowOnSpace(space: number): Promise<number | undefined> {
+    for (const [windowId, windowSpace] of [...this._spaceByWindow].reverse()) {
+      if (windowSpace !== space || this._isLaneWindow(windowId))
+        continue;
+      const window = await chrome.windows.get(windowId).catch(() => undefined);
+      if (window?.type === 'normal')
+        return windowId;
+      this._spaceByWindow.delete(windowId);
+    }
+    return undefined;
+  }
+
   // A window recorded before it was registered as a lane (creation focuses it
   // briefly) must never be treated as the user's window afterwards.
   forget(windowId: number): void {
     if (this._lastUserWindowId === windowId)
       this._lastUserWindowId = undefined;
+    this._spaceByWindow.delete(windowId);
   }
 }

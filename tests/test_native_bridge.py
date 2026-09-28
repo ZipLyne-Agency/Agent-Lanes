@@ -590,6 +590,30 @@ class NativeBridgeTests(unittest.TestCase):
             self.assertEqual(received, {"preparePool": 4, "auth": TOKEN})
             self.assertIn("must be foreground", process.stderr)
 
+    def test_native_host_answers_the_active_space_request(self):
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            token_file = tmp / "token"
+            token_file.write_text(TOKEN + "\n")
+            token_file.chmod(0o600)
+            native_output = io.BytesIO()
+            host = self.bridge.NativeHost(tmp / "bridge.sock", token_file, native_output=native_output)
+            with mock.patch.object(self.bridge, "active_space_id", return_value=7):
+                host._receive_extension_message({"type": "activeSpaceRequest", "requestId": "req-1"})
+                host._receive_extension_message({"type": "activeSpaceRequest", "requestId": ""})
+                host._receive_extension_message({"type": "activeSpaceRequest", "requestId": "x" * 200})
+            payload = native_output.getvalue()
+            length = struct.unpack("=I", payload[:4])[0]
+            self.assertEqual(json.loads(payload[4:4 + length]),
+                             {"type": "activeSpaceResult", "requestId": "req-1", "spaceId": 7})
+            self.assertEqual(len(payload), 4 + length, "malformed requests must get no answer")
+
+    def test_active_space_override_and_failure_are_safe(self):
+        with mock.patch.dict(os.environ, {"PLAYWRIGHT_MCP_ACTIVE_SPACE": "12"}):
+            self.assertEqual(self.bridge.active_space_id(), 12)
+        with mock.patch.dict(os.environ, {"PLAYWRIGHT_MCP_ACTIVE_SPACE": "not-a-space"}):
+            self.assertIsNone(self.bridge.active_space_id())
+
     def test_native_host_forwards_only_a_true_background_flag(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)

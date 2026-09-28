@@ -304,7 +304,7 @@ export async function laneHealth(lane: Lane): Promise<LaneHealth> {
       chrome.tabs.query({ windowId: lane.windowId }),
     ]);
     const anchorUrl = effectiveTabUrl(anchor);
-    const backgrounded = isBackgroundedLaneWindow(window);
+    const backgrounded = await isLaneWindowInService(window);
     const anchored = anchor.windowId === lane.windowId && anchorUrl === lane.markerUrl;
     return {
       healthy: backgrounded && anchored,
@@ -579,6 +579,19 @@ export function effectiveTabUrl(tab: chrome.tabs.Tab): string | undefined {
 // process-level invariant before connecting.
 export function isBackgroundedLaneWindow(window: chrome.windows.Window | undefined): boolean {
   return !!window && window.type === 'normal' && (window.state === 'normal' || window.state === 'fullscreen') && !window.focused;
+}
+
+// A lane can serve sessions when it is a backgrounded lane window, or when it is
+// a normal lane on the invisible agent display that macOS happened to focus
+// (a Space switch, Cmd-`). Nobody can see or use a hidden lane, so focus there
+// is not the user taking it; it passes as soon as the user clicks elsewhere.
+export async function isLaneWindowInService(window: chrome.windows.Window | undefined): Promise<boolean> {
+  if (isBackgroundedLaneWindow(window))
+    return true;
+  if (!window || window.type !== 'normal' || window.state !== 'normal')
+    return false;
+  const agentDisplay = await findAgentDisplay();
+  return !!agentDisplay && isWindowOnDisplay(window, agentDisplay);
 }
 
 function isPersistedLane(value: unknown): value is PersistedLane {

@@ -2,6 +2,18 @@
 
 Versions are the extension's `manifest.json` version.
 
+## 0.5.2 (2026-09-29)
+
+- **Fix: focus never jumps to another Space (desktop).** Lanes live on whichever Space
+  was active when they were created. When you switched to that Space with Chrome
+  active, macOS focused a hidden lane there, and 0.5.1 handed focus to your
+  last-used Chrome window, which was on another Space, so macOS switched you there.
+  The guard now asks the native host which Space is showing (`CGSGetActiveSpace`) and
+  hands focus only to your most recent window on that Space. With none known there,
+  focus stays on the idle hidden lane until you click elsewhere, and the lane keeps
+  serving its sessions. A window is opened only when you have no Chrome window at all.
+- The bridge turns Python 3.9's `socket.timeout` into `TimeoutError`.
+
 ## 0.5.1 (2026-09-28): first public release
 
 - Lanes live on an invisible virtual display ("Agent Lanes"), held by the new

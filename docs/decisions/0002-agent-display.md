@@ -84,3 +84,14 @@ helper, make the guard's `isHidden` dependency true for tucked lanes, and move
   virtual display, and "Displays have separate Spaces" turned on.
 - Chrome 154 crashed once on a debugger `Page.navigate` to `about:blank#<fragment>`. Not
   investigated further.
+
+## Addendum, 2026-09-29: Spaces
+
+The first hand-back focused the user's last-used Chrome window wherever it was. Lanes
+live on whichever Space was active when they were created, so switching to that Space
+with Chrome active made macOS focus a lane, the guard focused a window on another
+Space, and macOS switched the user there. Version 0.5.2 reads the current Space from
+the native host (`CGSGetActiveSpace`), records which Space each user window was
+focused on, and hands focus only to a window on the current Space. The live
+hand-back test had run on a single Space, which is why this was missed.
+

@@ -75,3 +75,13 @@ export function isNativeDiscardPoolMessage(message: unknown): message is Extract
   const candidate = message as Partial<Extract<NativeHostMessage, { type: 'discardPool' }>>;
   return candidate.type === 'discardPool' && typeof candidate.requestId === 'string' && candidate.requestId.length <= 128;
 }
+
+// The host's answer to an extension-initiated activeSpaceRequest. spaceId is
+// the macOS Space the user is on, or null when it could not be read.
+export function isNativeActiveSpaceResult(message: unknown): message is { type: 'activeSpaceResult'; requestId: string; spaceId: number | null } {
+  if (!message || typeof message !== 'object')
+    return false;
+  const candidate = message as { type?: unknown; requestId?: unknown; spaceId?: unknown };
+  return candidate.type === 'activeSpaceResult' && typeof candidate.requestId === 'string' && candidate.requestId.length <= 128 &&
+    (candidate.spaceId === null || (typeof candidate.spaceId === 'number' && Number.isSafeInteger(candidate.spaceId) && candidate.spaceId > 0));
+}

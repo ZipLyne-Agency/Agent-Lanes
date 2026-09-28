@@ -51,8 +51,8 @@ def read_socket_line(connection: socket.socket, timeout: float) -> bytes:
         try:
             chunk = connection.recv(min(4096, MAX_SOCKET_MESSAGE + 1 - len(data)))
         except socket.timeout as error:
-            # Python 3.9 (the macOS system python3) raises socket.timeout, which
-            # only became an alias of TimeoutError in 3.10.
+            # Python 3.9 (the macOS system python3, which Chrome uses to start
+            # this host) raises socket.timeout; it became TimeoutError in 3.10.
             raise TimeoutError("native bridge socket read timed out") from error
         if not chunk:
             raise ValueError("incomplete native bridge message")
@@ -102,6 +102,26 @@ CHROME_BUNDLE_ID = "com.google.Chrome"
 # preparation stays off until someone deletes it.
 FRONTMOST_SAMPLE_SECONDS = 0.05
 FRONTMOST_SETTLE_SECONDS = 3.0
+
+
+def active_space_id() -> int | None:
+    """The macOS Space (desktop) the user is on, read from CoreGraphics'
+    private CGSGetActiveSpace; None when it cannot be read. The extension uses
+    it so focus is never handed to a window on another Space, which would make
+    macOS switch Spaces."""
+    override = os.environ.get("PLAYWRIGHT_MCP_ACTIVE_SPACE")
+    if override is not None:
+        return int(override) if override.isdigit() and int(override) > 0 else None
+    try:
+        import ctypes
+        coregraphics = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        coregraphics.CGSMainConnectionID.restype = ctypes.c_int
+        coregraphics.CGSGetActiveSpace.restype = ctypes.c_uint64
+        coregraphics.CGSGetActiveSpace.argtypes = [ctypes.c_int]
+        space = int(coregraphics.CGSGetActiveSpace(coregraphics.CGSMainConnectionID()))
+    except (OSError, AttributeError, ValueError):
+        return None
+    return space if 0 < space < 2 ** 53 else None
 
 
 def _background_fuse_path() -> Path:
@@ -499,6 +519,17 @@ class NativeHost:
             connection.sendall(json.dumps(response, separators=(",", ":")).encode() + b"\n")
 
     def _receive_extension_message(self, message: dict) -> None:
+        # The one request the extension starts itself: which Space is showing.
+        if message.get("type") == "activeSpaceRequest":
+            request_id = message.get("requestId")
+            if isinstance(request_id, str) and 0 < len(request_id) <= 128:
+                with self.write_lock:
+                    write_native_message(self.native_output, {
+                        "type": "activeSpaceResult",
+                        "requestId": request_id,
+                        "spaceId": active_space_id(),
+                    })
+            return
         if message.get("type") not in {"connectResult", "statusResult", "preparePoolResult", "discardPoolResult"} or not isinstance(message.get("requestId"), str):
             return
         with self.pending_lock:

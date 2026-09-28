@@ -78,10 +78,15 @@ Each lane has a guard that watches for two things that must never quietly happen
 - **You taking the lane.** On a visible screen, focusing, moving, resizing, minimizing,
   or maximizing a lane makes it yours: every session in it ends, its tabs are kept, and
   its anchor becomes a tombstone so it is never re-adopted. On the hidden display
-  nobody can see a lane, so focus that lands there (Chrome's Dock icon, Cmd-\`, the
-  Window menu) is handed straight back to your window and the sessions keep running. If
-  you have no window open, the guard opens one on your main screen, because Chrome
-  counts the hidden lanes as visible windows and would otherwise show you nothing.
+  nobody can see a lane. macOS focuses one when you switch to the Space (desktop)
+  where it lives with Chrome active, or through Chrome's Dock icon, Cmd-\`, or the
+  Window menu. The guard asks the native host which Space is showing and hands focus
+  to your most recent window **on that Space**; focusing a window on another Space
+  would make macOS switch you there. With none known on the current Space, focus
+  stays on the idle lane until you click elsewhere, and its sessions keep running.
+  If you have no Chrome window at all, the guard opens one on the current Space,
+  because Chrome counts the hidden lanes as visible windows and would otherwise show
+  you nothing.
 
 ## The hidden display
 

@@ -63,10 +63,17 @@ function createChromeFake(options = {}) {
     debuggerEvent: createEvent(),
     debuggerDetach: createEvent(),
   };
+  // The macOS Space the native host reports; undefined answers null.
+  let activeSpace = options.activeSpace;
   const port = {
     onMessage: createEvent(),
     onDisconnect: createEvent(),
-    postMessage(message) { log.portMessages.push(message); },
+    postMessage(message) {
+      log.portMessages.push(message);
+      // The host answers the one request the extension starts itself.
+      if (message?.type === 'activeSpaceRequest')
+        setTimeout(() => port.onMessage.emit({ type: 'activeSpaceResult', requestId: message.requestId, spaceId: activeSpace ?? null }), 1);
+    },
   };
   let sendCommandHook = async () => ({ forwarded: true });
 
@@ -400,6 +407,8 @@ function createChromeFake(options = {}) {
     addTab: (windowId, options) => tabView(addTab(windowId, options)),
     windowTabs: windowId => windowTabs(windowId).map(tabView),
     setSendCommandHook: hook => { sendCommandHook = hook; },
+    // The user switching macOS Spaces (desktops).
+    setActiveSpace: space => { activeSpace = space; },
     // macOS adding or removing a display; Chrome reports it after the fact.
     setDisplays: next => {
       displays = next;

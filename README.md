@@ -137,7 +137,7 @@ proven and what has not.
 | 24 simultaneous agents across four lanes, trusted input, exact cleanup, no focus or Space change | 2026-09-04 |
 | Lanes on the invisible display: 61 fps, trusted typing, clicks, and screenshots with another app in front | 2026-09-28 |
 | Background refill: 12 lane windows created and 15 closed without Chrome coming forward | 2026-09-28 |
-| Focus that lands on a hidden lane is handed back in under half a second; the agent keeps working | 2026-09-28 |
+| Focus that lands on a hidden lane is handed back in under half a second; the agent keeps working (one Space; 0.5.2 keeps the hand-back on the current Space) | 2026-09-28 |
 | An extension reload keeps the pool (the reloaded lanes are re-anchored) | 2026-09-28 |
 | After a Chrome crash and relaunch, lanes were re-adopted by their markers; one holding a leftover session tab was kept aside for the user, as designed | 2026-09-28 |
 

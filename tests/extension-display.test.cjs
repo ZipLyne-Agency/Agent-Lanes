@@ -146,24 +146,58 @@ async function main() {
   assert.equal(fake.focusedWindowId, undefined, 'background preparation activated Chrome');
   fake.focusWindow(user.id);
 
-  // ── Focus on a hidden lane is handed back; sessions keep running ────────
+  // ── Focus on a hidden lane goes back only to a window on the same Space ──
+  // Two user windows on two Spaces (desktops), each used there.
+  const deskOne = fake.addWindow({ type: 'normal', url: 'https://example.com/desk-one', left: 0, top: 31, width: 2048, height: 1121 });
+  fake.setActiveSpace(1);
+  fake.focusWindow(deskOne.id);
+  await fake.settle(60);
+  fake.setActiveSpace(2);
+  fake.focusWindow(user.id);
+  await fake.settle(60);
   const conn = fakeConnection('agent');
   await extension._establishConnection(conn, undefined, 'agent');
   const busyLane = conn.lane.windowId;
-  fake.focusWindow(busyLane); // Cmd-`, the Window menu, or the Dock icon
+  // The user switches to Desktop 1 with Chrome active; macOS focuses a hidden lane there.
+  fake.setActiveSpace(1);
+  fake.focusWindow(busyLane);
   await fake.settle(450);
+  assert.equal(fake.focusedWindowId, deskOne.id,
+      'focus went to a window on another Space, which makes macOS switch Spaces');
   assert.equal(conn.workspaceReclaimed, false, 'focus on a hidden lane ended its sessions');
   assert.ok(pool.some(lane => lane.windowId === busyLane), 'a hidden lane left the pool on focus');
-  assert.equal(fake.focusedWindowId, user.id, 'focus was not handed back to the user window');
+  await fake.settle(1600);
+
+  // A Space with none of the user's windows: focus stays on the lane rather
+  // than dragging the user to another Space, and the lane keeps working.
+  const focusCallsBefore = fake.log.focusUpdates.length;
+  fake.setActiveSpace(3);
+  fake.focusWindow(busyLane);
+  await fake.settle(450);
+  assert.equal(fake.log.focusUpdates.length, focusCallsBefore, 'a window on another Space was focused');
+  assert.equal(fake.focusedWindowId, busyLane);
   const backgrounded = await conn.lane.isBackgrounded();
-  assert.equal(backgrounded.ok, true, `session saw its lane as unsafe during the hand-back (${backgrounded.diagnostic})`);
+  assert.equal(backgrounded.ok, true, `a focused hidden lane stopped serving its session (${backgrounded.diagnostic})`);
+  assert.equal(conn.workspaceReclaimed, false);
+  // Placement moving a focused hidden lane is not a reclaim either.
+  await chrome.windows.update(busyLane, { left: AGENT.bounds.left + 10 });
+  await fake.settle(60);
+  assert.equal(conn.workspaceReclaimed, false, 'moving a focused hidden lane reclaimed it');
+  fake.focusWindow(user.id);
   conn.close('browser_close');
   await fake.settle(1600);
 
   // ── Dock icon with only lanes open gives the user a window ──────────────
-  fake.tabs.delete(fake.windowTabs(user.id)[0].id);
-  fake.windows.delete(user.id);
-  fake.events.windowsRemoved.emit(user.id);
+  // Close every window that is not a lane, so only lanes are open.
+  for (const windowId of [...fake.windows.keys()]) {
+    if (extension._laneRuntimes.has(windowId))
+      continue;
+    for (const tab of fake.windowTabs(windowId))
+      fake.tabs.delete(tab.id);
+    fake.windows.delete(windowId);
+    fake.events.windowsRemoved.emit(windowId);
+  }
+  fake.setActiveSpace(2);
   fake.focusWindow(pool[0].windowId);
   await fake.settle(450);
   const opened = fake.log.createdWindows.at(-1);

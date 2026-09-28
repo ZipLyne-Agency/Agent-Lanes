@@ -19,7 +19,7 @@
 import { debugLog } from './relayConnection';
 import { openRelayConnection, PendingConnections } from './pendingConnection';
 import { ConnectedTabGroup, isNonDebuggableUrl, ungroupTabs, uniqueGroupStyle } from './connectedTabGroup';
-import { isNativeConnectMessage, isNativeDiscardPoolMessage, isNativePreparePoolMessage, isNativeReadyMessage, isNativeStatusMessage } from './nativeProtocol';
+import { isNativeActiveSpaceResult, isNativeConnectMessage, isNativeDiscardPoolMessage, isNativePreparePoolMessage, isNativeReadyMessage, isNativeStatusMessage } from './nativeProtocol';
 import { cleanupStaleState, createSessionTab, discardLanes, isLaneMarkerUrl, isLaneOnAgentDisplay, Lane, LANE_CAPACITY, laneHealth, laneWindowState, loadLanes, moveLanesToAgentDisplay, prepareLanePool, SESSION_STORAGE_PREFIX, tombstoneReclaimedLane } from './workspaceLifecycle';
 import { findAgentDisplay, onDisplayChanged, returnStrayWindows } from './agentDisplay';
 import { LaneStage } from './laneStage';
@@ -81,6 +81,7 @@ export class PlaywrightExtension {
   private _capacityWaiters: Array<() => void> = [];
   private _userWindows: UserWindowTracker;
   private _placementTimer: ReturnType<typeof setTimeout> | undefined;
+  private _nativeRequests = new Map<string, (spaceId: number | undefined) => void>();
 
   constructor() {
     this._browserSessionPromise = new Promise(resolve => this._resolveBrowserSession = resolve);
@@ -92,7 +93,7 @@ export class PlaywrightExtension {
     chrome.runtime.onStartup.addListener(() => {});
     chrome.runtime.onMessage.addListener(this._onMessage.bind(this));
     chrome.action.onClicked.addListener(this._onActionClicked.bind(this));
-    this._userWindows = new UserWindowTracker(windowId => this._laneRuntimes.has(windowId));
+    this._userWindows = new UserWindowTracker(windowId => this._laneRuntimes.has(windowId), () => this._activeSpaceId());
     this._cleanupPromise = this._browserSessionPromise.then(browserSessionId => cleanupStaleState(browserSessionId));
     this._workspacePoolPromise = this._cleanupPromise.then(() => loadLanes(this._browserSessionId)).then(lanes => {
       for (const lane of lanes)
@@ -147,7 +148,39 @@ export class PlaywrightExtension {
     });
   }
 
+  // The macOS Space (desktop) the user is on, from the native host. Undefined
+  // whenever it cannot be read quickly; callers then change nothing.
+  private _activeSpaceId(): Promise<number | undefined> {
+    const port = this._nativePort;
+    if (!port)
+      return Promise.resolve(undefined);
+    const requestId = crypto.randomUUID();
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        this._nativeRequests.delete(requestId);
+        resolve(undefined);
+      }, 750);
+      this._nativeRequests.set(requestId, spaceId => {
+        clearTimeout(timer);
+        resolve(spaceId);
+      });
+      try {
+        port.postMessage({ type: 'activeSpaceRequest', requestId });
+      } catch {
+        clearTimeout(timer);
+        this._nativeRequests.delete(requestId);
+        resolve(undefined);
+      }
+    });
+  }
+
   private async _onNativeHostMessage(port: chrome.runtime.Port, message: unknown): Promise<void> {
+    if (isNativeActiveSpaceResult(message)) {
+      const resolve = this._nativeRequests.get(message.requestId);
+      this._nativeRequests.delete(message.requestId);
+      resolve?.(message.spaceId ?? undefined);
+      return;
+    }
     if (isNativeReadyMessage(message)) {
       if (this._browserSessionId === undefined) {
         this._browserSessionId = message.browserSessionId;
@@ -420,6 +453,10 @@ export class PlaywrightExtension {
       },
       onReclaimed: reason => void this._reclaimLane(runtime, reason),
       isHidden: () => isLaneOnAgentDisplay(lane.windowId),
+      userWindowOnCurrentSpace: async () => {
+        const space = await this._activeSpaceId();
+        return space === undefined ? undefined : await this._userWindows.lastUserWindowOnSpace(space);
+      },
     });
     this._laneRuntimes.set(lane.windowId, runtime);
     return runtime;
