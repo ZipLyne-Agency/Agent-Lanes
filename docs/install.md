@@ -3,7 +3,7 @@
 ## Requirements
 
 - macOS. Only macOS 27.0 on Apple silicon, with two monitors, has been tested.
-- Google Chrome in `/Applications` (tested on Chrome 154; auto-connect debugging needs
+- Google Chrome at exactly `/Applications/Google Chrome.app` (tested on Chrome 154; auto-connect debugging needs
   144+)
 - Node.js 20 or newer, and npm
 - Xcode Command Line Tools (`xcode-select --install`) for `/usr/bin/python3` and

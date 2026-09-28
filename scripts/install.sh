@@ -32,7 +32,8 @@ LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 HOST_NAME="agency.ziplyne.agent_lanes"
 DISPLAY_LABEL="agency.ziplyne.agent-lane-display"
 BACKUP="$STATE/backups/$(date +%Y%m%d-%H%M%S)"
-CHROME_APP="${AGENT_LANES_CHROME_APP:-/Applications/Google Chrome.app}"
+# The launcher, the Chrome checks, and the MCP launcher all expect this exact path.
+CHROME_APP="/Applications/Google Chrome.app"
 
 say() { printf '==> %s\n' "$*"; }
 fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -60,7 +61,9 @@ preflight() {
   node_major="$(node -p 'process.versions.node.split(".")[0]')"
   [ "$node_major" -ge 20 ] || fail "Node.js 20 or newer is required (found $(node -v))"
   command -v npm >/dev/null || fail "npm is required"
-  [ -x /usr/bin/python3 ] || fail "/usr/bin/python3 is required (xcode-select --install)"
+  # /usr/bin/python3 and clang are stubs until the Command Line Tools are installed.
+  xcode-select -p >/dev/null 2>&1 || fail "the Xcode Command Line Tools are required (xcode-select --install)"
+  /usr/bin/python3 -c "import sys" >/dev/null 2>&1 || fail "/usr/bin/python3 does not run (xcode-select --install)"
   if [ "$display" = 1 ]; then
     /usr/bin/xcrun --find clang >/dev/null 2>&1 || fail "clang is required for the display helper (xcode-select --install), or pass --no-display"
   fi
