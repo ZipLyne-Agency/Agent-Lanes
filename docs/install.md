@@ -57,6 +57,13 @@ These steps are yours; Chrome treats them as human-only.
    ```
 
    `parkedWorkspaceCount` should be 4 and `agentDisplay.present` should be `true`.
+5. **Allow Accessibility for `agent-lane-display`** when macOS asks, or in System
+   Settings, Privacy & Security, Accessibility. It lets the helper keep other apps'
+   windows, and the keyboard focus, off the invisible screen.
+   `~/.local/bin/agent-lane-display status` shows `"windowGuard": "active"` once it
+   is on. Installed ad hoc, the grant has to be renewed after an update that changes
+   the helper; set `AGENT_LANES_SIGN_IDENTITY` to a Developer ID before installing to
+   avoid that.
 
 ## 3. Connect your agents
 
@@ -147,8 +154,13 @@ and could not be refilled in the background. Check that the display is up
 `~/.local/state/agent-lanes/background-prep-disabled.json` exists (see
 [operations](operations.md#refill)).
 
-**Chrome says it is "not-ready".** Chrome was opened without the launcher, or
-relaunched itself after a crash. Quit it with Command-Q and open it with the launcher.
+**Chrome says it is "not-ready".** Chrome was opened without the launcher, relaunched
+itself after a crash, or was reopened by macOS at login after a restart. Quit it with
+Command-Q and open it with the launcher.
+
+**A window of another app disappeared.** It probably opened on the invisible screen.
+With Accessibility allowed, the helper moves it back within a second; otherwise run
+`~/.local/bin/agent-lane-display guard-once` from a terminal that has Accessibility.
 
 **Will this interfere with my screen sharing?** Screen-share pickers list a third
 display called Agent Lanes. Share a specific screen or window.

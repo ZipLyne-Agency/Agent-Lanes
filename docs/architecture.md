@@ -110,6 +110,25 @@ working as a visible corner stack. When the display returns, the lanes go back.
 macOS reports windows on the virtual display as occluded, so the occlusion switch is
 what keeps them rendering.
 
+## Keeping everything else off the display
+
+Two guards in `agent-lane-display`, behind one Accessibility grant:
+
+- **Focus guard.** While an invisible lane holds the keyboard, macOS treats Agent Lanes
+  as the main screen, so every app opens new windows and dialogs there. A lane gets
+  the keyboard when you switch, with Chrome active, to a desktop holding a lane but
+  none of your Chrome windows, or through Cmd-\`. Every 250 ms while Chrome is
+  frontmost the helper asks Chrome which window holds its keyboard (the app-level
+  Accessibility query window managers make; it does not switch on accessibility for
+  web content). Stacking order cannot answer this: lanes sit above your windows in
+  the window list even on desktops where they are not shown. After a lane has held
+  the keyboard for about a second it raises your full-size Chrome window on the
+  current desktop, or activates Finder, whose desktop is on every Space.
+- **Window guard.** Every second, any ordinary window (layer 0 to 20) of another app
+  whose middle sits on Agent Lanes moves, unfocused, to the screen your pointer is
+  on. Chrome's windows are the extension's job, and the AutoFill popup beside a lane's
+  login field stays with it. Overlays an app shows on every screen are left alone.
+
 ## Refill and the fuse
 
 The launcher app runs a loop every second while Chrome is open. When the pool is

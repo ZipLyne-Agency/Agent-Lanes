@@ -2,6 +2,25 @@
 
 Versions are the extension's `manifest.json` version.
 
+## 0.5.3 (2026-10-04)
+
+- **Nothing else lands on Agent Lanes.** The display helper gains two guards behind
+  one Accessibility grant. A focus guard never lets an invisible lane keep the
+  keyboard: while it does, macOS treats Agent Lanes as the main screen and every app
+  opens new windows, dialogs, and launcher panels there. It asks Chrome which window
+  holds the keyboard, and after a lane has held it for about a second it raises your
+  Chrome window on the current desktop, or activates Finder, so no desktop switch
+  happens. A window guard moves any other app's ordinary window off Agent Lanes
+  to the screen your pointer is on, leaves per-screen overlays alone, and stops after
+  three moves in a minute if an app keeps putting a window back.
+- The extension returns a Chrome window dragged or "Move to"-ed onto Agent Lanes, and
+  re-adopts anchor-only lanes whenever windows change, which fixes an empty pool after
+  a Mac restart (session restore brought the lanes back after the extension looked).
+- `agent-lane-display guard-once` and `guard-watch <seconds>` run the guards by hand;
+  `status` reports `windowGuard`.
+- `scripts/install.sh` signs the helper (set `AGENT_LANES_SIGN_IDENTITY` to a
+  Developer ID so the Accessibility grant survives rebuilds).
+
 ## 0.5.2 (2026-09-29)
 
 - **Fix: focus never jumps to another Space (desktop).** Lanes live on whichever Space

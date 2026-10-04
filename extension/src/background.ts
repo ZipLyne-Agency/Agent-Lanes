@@ -20,7 +20,7 @@ import { debugLog } from './relayConnection';
 import { openRelayConnection, PendingConnections } from './pendingConnection';
 import { ConnectedTabGroup, isNonDebuggableUrl, ungroupTabs, uniqueGroupStyle } from './connectedTabGroup';
 import { isNativeActiveSpaceResult, isNativeConnectMessage, isNativeDiscardPoolMessage, isNativePreparePoolMessage, isNativeReadyMessage, isNativeStatusMessage } from './nativeProtocol';
-import { cleanupStaleState, createSessionTab, discardLanes, isLaneMarkerUrl, isLaneOnAgentDisplay, Lane, LANE_CAPACITY, laneHealth, laneWindowState, loadLanes, moveLanesToAgentDisplay, prepareLanePool, SESSION_STORAGE_PREFIX, tombstoneReclaimedLane } from './workspaceLifecycle';
+import { adoptUnpooledLanes, cleanupStaleState, createSessionTab, discardLanes, isLaneMarkerUrl, MAX_LANES, isLaneOnAgentDisplay, Lane, LANE_CAPACITY, laneHealth, laneWindowState, loadLanes, moveLanesToAgentDisplay, prepareLanePool, SESSION_STORAGE_PREFIX, tombstoneReclaimedLane } from './workspaceLifecycle';
 import { findAgentDisplay, onDisplayChanged, returnStrayWindows } from './agentDisplay';
 import { LaneStage } from './laneStage';
 import { LaneGuard, UserWindowTracker } from './laneGuard';
@@ -103,6 +103,8 @@ export class PlaywrightExtension {
     void this._workspacePoolPromise.then(() => this._schedulePlacement(0));
     onDisplayChanged(() => this._schedulePlacement());
     chrome.windows.onCreated?.addListener(() => this._schedulePlacement());
+    // A window dragged or "Move to"-ed onto the agent display comes back too.
+    chrome.windows.onBoundsChanged?.addListener(() => this._schedulePlacement());
     this._connectNativeHost();
   }
 
@@ -120,6 +122,18 @@ export class PlaywrightExtension {
   private async _placeWindows(): Promise<void> {
     await this._withWorkspaceManagement(async () => {
       const pool = await this._workspacePoolPromise;
+      // Chrome's session restore can bring lane windows back after the loader
+      // looked for them (seen after a Mac restart: an empty pool beside four
+      // anchor-only lanes). Any window holding nothing but a live marker is an
+      // unclaimed lane; take it back here instead of waiting for a preparer.
+      const before = pool.length;
+      await adoptUnpooledLanes(pool, MAX_LANES, this._browserSessionId);
+      for (const lane of pool.slice(before)) {
+        this._reclaimedWindowIds.delete(lane.windowId);
+        this._ensureLaneRuntime(lane);
+      }
+      if (pool.length > before)
+        this._notifyCapacity();
       const moved = await moveLanesToAgentDisplay(pool);
       // Kept on the agent display: pooled lanes, and unpooled windows that hold
       // nothing but a live marker (a lane being provisioned, or a leftover the

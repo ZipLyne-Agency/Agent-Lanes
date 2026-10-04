@@ -228,16 +228,23 @@ async function main() {
   assert.equal(reclaimConn.workspaceReclaimed, true);
   assert.ok(onDisplay(fake.windows.get(reclaimedLane), PRIMARY), 'the reclaimed lane stayed on the invisible display');
 
-  // ── Unpooled marker-only lanes are adopted without a new window ─────────
-  const leftover = fake.addWindow({ type: 'normal', url: marker('leftover'), ...hidden });
-  await fake.settle(900);
-  assert.ok(onDisplay(fake.windows.get(leftover.id), AGENT), 'a marker-only lane window was pushed off the agent display');
-  fake.focusWindow(newUser);
+  // ── Lanes Chrome restores after the loader ran are adopted on their own ──
+  // After a Mac restart, session restore brought four anchor-only lanes back
+  // after the extension had looked for them, leaving the pool empty.
   const createdBeforeAdopt = fake.log.createdWindows.length;
-  const adopted = await extension._preparePool(pool.length + 1);
+  const restored = fake.addWindow({ type: 'normal', url: marker('restored-late'), ...corner });
+  await fake.settle(900);
+  assert.ok(pool.some(lane => lane.windowId === restored.id), 'a lane restored after load was not adopted');
+  assert.ok(onDisplay(fake.windows.get(restored.id), AGENT), 'the adopted lane was not placed on the agent display');
+  const adopted = await extension._preparePool(pool.length);
   assert.equal(adopted.created, 0);
-  assert.ok(adopted.parkedWorkspaceIds.includes(leftover.id), 'the leftover lane was not adopted');
-  assert.equal(fake.log.createdWindows.length, createdBeforeAdopt, 'adoption created a window');
+  assert.equal(fake.log.createdWindows.length, createdBeforeAdopt + 1, 'adoption created a window of its own');
+
+  // ── A Chrome window dragged onto the agent display comes back ───────────
+  fake.focusWindow(newUser);
+  await chrome.windows.update(newUser, { left: AGENT.bounds.left + 100, top: AGENT.bounds.top + 100 });
+  await fake.settle(900);
+  assert.ok(onDisplay(fake.windows.get(newUser), PRIMARY), 'a user window moved onto the agent display was left there');
 
   console.log('Playwright extension agent display tests passed');
 }

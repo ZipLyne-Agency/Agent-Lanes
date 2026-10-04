@@ -473,7 +473,7 @@ export async function prepareLanePool(pool: Lane[], targetCapacity: number, opti
 // marker is unclaimed (a crash restored it beside tabs that have since closed,
 // or its record was dropped). Taking it back needs no new window. Reclaimed
 // lanes carry a tombstone marker and are never matched here.
-async function adoptUnpooledLanes(pool: Lane[], targetCapacity: number, browserSessionId?: string): Promise<void> {
+export async function adoptUnpooledLanes(pool: Lane[], targetCapacity: number, browserSessionId?: string): Promise<void> {
   const tabs = await chrome.tabs.query({}).catch(() => [] as chrome.tabs.Tab[]);
   for (const tab of tabs) {
     if (pool.length >= targetCapacity)

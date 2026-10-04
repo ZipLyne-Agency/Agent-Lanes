@@ -53,6 +53,8 @@ place() {
 
 render() { sed "s|__HOME__|$HOME|g" "$1"; }
 
+cdhash() { [ -e "$1" ] && codesign -dvvv "$1" 2>&1 | sed -n 's/^CDHash=//p'; }
+
 preflight() {
   [ "$(uname -s)" = Darwin ] || fail "macOS only (the launcher, native host paths, and display helper are macOS-specific)"
   [ -d "$CHROME_APP" ] || fail "Google Chrome is not installed at $CHROME_APP"
@@ -141,10 +143,15 @@ install_display() {
   say "Building and starting the Agent Lanes display helper"
   local build plist="$LAUNCH_AGENTS/$DISPLAY_LABEL.plist" rendered changed=0
   build="$(mktemp "${TMPDIR:-/tmp}/agent-lane-display.XXXXXX")"
-  /usr/bin/xcrun clang -fobjc-arc -O2 -Wall -framework AppKit -framework CoreGraphics \
+  /usr/bin/xcrun clang -fobjc-arc -O2 -Wall -framework AppKit -framework CoreGraphics -framework ApplicationServices \
     -o "$build" "$REPO/agent-display/agent-lane-display.m"
-  if ! cmp -s "$build" "$BIN/agent-lane-display" 2>/dev/null; then
+  # The guards need Accessibility, which macOS ties to the code signature. Set
+  # AGENT_LANES_SIGN_IDENTITY to a Developer ID to keep one grant across
+  # rebuilds; ad hoc signing needs a fresh grant whenever the code changes.
+  codesign --force --sign "${AGENT_LANES_SIGN_IDENTITY:--}" --identifier "$DISPLAY_LABEL" --timestamp=none "$build" 2>/dev/null
+  if [ "$(cdhash "$build")" != "$(cdhash "$BIN/agent-lane-display" 2>/dev/null)" ]; then
     place "$build" "$BIN/agent-lane-display" 755
+    rm -f "$STATE/display/accessibility-prompted"
     changed=1
   fi
   rm -f "${build:?}"
@@ -169,7 +176,7 @@ install_display() {
 print_next_steps() {
   cat <<EOF
 
-Installed. Four things are left, and they are yours to do in Chrome:
+Installed. Five things are left, and they are yours to do:
 
   1. Remove the Chrome Web Store "Playwright MCP Bridge" extension if you have it.
      It shares this extension's ID.
@@ -183,6 +190,9 @@ Installed. Four things are left, and they are yours to do in Chrome:
      loaded exactly that path.
   4. Click into Chrome once. The launcher creates the agent windows, then check:
        ~/.local/bin/playwright-mcp-native-bridge --status
+  5. Allow Accessibility for agent-lane-display when macOS asks (or in System
+     Settings, Privacy & Security, Accessibility). It keeps other apps' windows,
+     and the keyboard focus, off the invisible Agent Lanes screen.
 
 Then point your agent at the MCP server (see docs/install.md for Claude Code,
 Codex, and Cursor):
