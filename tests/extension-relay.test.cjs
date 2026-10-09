@@ -321,6 +321,108 @@ async function testGuard() {
   guard3.dispose();
 }
 
+// "Leave site?" prompts on agent tabs are accepted by the extension and never
+// reach the agent; every other dialog still does.
+async function testLeavePrompt() {
+  const { closeAgentTabs } = require(path.join(compiledDir, 'leavePrompt.js'));
+  const lane = fake.addWindow({ type: 'normal', url: marker('leave') });
+  const forwarded = [];
+  const ws = { ...socket(), readyState: 1, send(data) { forwarded.push(JSON.parse(data)); } };
+  const connection = new RelayConnection(ws);
+  const tab = fake.addTab(lane.id, { active: false });
+  connection.markOwnedTab(tab.id);
+  await connection._notifyTabAttached(tab.id);
+  const dialogMethods = () => forwarded.map(m => m.params?.[1]).filter(m => /Dialog/.test(m ?? ''));
+  const accepts = () => fake.log.debuggerCommands.filter(([, method]) => method === 'Page.handleJavaScriptDialog');
+
+  const acceptsBefore = accepts().length;
+  fake.events.debuggerEvent.emit({ tabId: tab.id }, 'Page.javascriptDialogOpening', { type: 'beforeunload', message: '' });
+  await sleep(5);
+  assert.deepEqual(accepts().slice(acceptsBefore), [[{ tabId: tab.id }, 'Page.handleJavaScriptDialog', { accept: true }]], 'leave prompt was not accepted');
+  fake.events.debuggerEvent.emit({ tabId: tab.id }, 'Page.javascriptDialogClosed', { result: true, userInput: '' });
+  await sleep(5);
+  assert.deepEqual(dialogMethods(), [], 'leave prompt or its close reached the agent');
+
+  // A child session's prompt is answered on that session.
+  fake.events.debuggerEvent.emit({ tabId: tab.id, sessionId: 'child' }, 'Page.javascriptDialogOpening', { type: 'beforeunload', message: '' });
+  await sleep(5);
+  assert.deepEqual(accepts().at(-1)?.[0], { tabId: tab.id, sessionId: 'child' }, 'child session prompt answered on the wrong session');
+
+  // An alert is the agent's to answer.
+  const acceptsBeforeAlert = accepts().length;
+  fake.events.debuggerEvent.emit({ tabId: tab.id }, 'Page.javascriptDialogOpening', { type: 'alert', message: 'hi' });
+  fake.events.debuggerEvent.emit({ tabId: tab.id }, 'Page.javascriptDialogClosed', { result: true, userInput: '' });
+  await sleep(5);
+  assert.equal(accepts().length, acceptsBeforeAlert, 'the extension answered an alert');
+  assert.deepEqual(dialogMethods(), ['Page.javascriptDialogOpening', 'Page.javascriptDialogClosed'], 'alert did not reach the agent');
+
+  // A tab this connection does not have attached is never touched.
+  const userTab = fake.addTab(lane.id, { active: false });
+  fake.events.debuggerEvent.emit({ tabId: userTab.id }, 'Page.javascriptDialogOpening', { type: 'beforeunload', message: '' });
+  await sleep(5);
+  assert.ok(!accepts().some(([target]) => target.tabId === userTab.id), 'a prompt on an unattached tab was answered');
+  connection.close('test done');
+
+  // Closing tabs after the relay detached: a dirty tab's prompt is accepted
+  // during its close, a clean tab just closes, and an unattachable tab is
+  // still removed.
+  const dirty = fake.addTab(lane.id, { active: false });
+  const clean = fake.addTab(lane.id, { active: false });
+  const locked = fake.addTab(lane.id, { active: false });
+  const busy = fake.addTab(lane.id, { active: false });
+  const originalRemove = chrome.tabs.remove;
+  const originalAttach = chrome.debugger.attach;
+  let busyAttempts = 0;
+  chrome.debugger.attach = async target => {
+    if (target.tabId === locked.id)
+      throw new Error('Cannot access a chrome:// URL');
+    if (target.tabId === busy.id && ++busyAttempts === 1)
+      throw new Error('Another debugger is already attached to the tab with id: ' + busy.id);
+    return originalAttach(target);
+  };
+  chrome.tabs.remove = async tabIds => {
+    for (const tabId of Array.isArray(tabIds) ? tabIds : [tabIds]) {
+      if (tabId === dirty.id)
+        setTimeout(() => fake.events.debuggerEvent.emit({ tabId }, 'Page.javascriptDialogOpening', { type: 'beforeunload', message: '' }), 10);
+      else
+        await originalRemove(tabId);
+    }
+  };
+  fake.setSendCommandHook(async (target, method) => {
+    if (method === 'Page.handleJavaScriptDialog' && target.tabId === dirty.id)
+      await originalRemove(dirty.id);
+    return {};
+  });
+  const listenersBefore = fake.events.debuggerEvent.listeners.size;
+  const removedListenersBefore = fake.events.tabsRemoved.listeners.size;
+  try {
+    await closeAgentTabs([dirty.id, clean.id, locked.id, busy.id], 1000);
+  } finally {
+    chrome.tabs.remove = originalRemove;
+    chrome.debugger.attach = originalAttach;
+    fake.setSendCommandHook(async () => ({ forwarded: true }));
+  }
+  for (const closed of [dirty, clean, locked, busy])
+    assert.ok(!fake.tabs.has(closed.id), `tab ${closed.id} was not closed`);
+  assert.ok(accepts().some(([target, , params]) => target.tabId === dirty.id && params.accept === true), 'prompt during close was not accepted');
+  assert.ok(fake.log.debuggerCommands.some(([target, method]) => target.tabId === busy.id && method === 'Page.enable'), 'attach was not retried after the relay detached');
+  assert.ok(!fake.log.debuggerCommands.some(([target]) => target.tabId === locked.id), 'commands went to a tab that could not be attached');
+  assert.equal(fake.events.debuggerEvent.listeners.size, listenersBefore, 'close left a debugger listener behind');
+  assert.equal(fake.events.tabsRemoved.listeners.size, removedListenersBefore, 'close left a tab listener behind');
+
+  // A prompt nobody can answer does not hang cleanup.
+  const stuck = fake.addTab(lane.id, { active: false });
+  chrome.tabs.remove = async () => {};
+  const started = Date.now();
+  try {
+    await closeAgentTabs([stuck.id], 60);
+  } finally {
+    chrome.tabs.remove = originalRemove;
+  }
+  assert.ok(Date.now() - started < 1000, 'close waited past its timeout');
+  assert.ok(fake.log.debuggerDetaches.some(target => target.tabId === stuck.id), 'debugger left attached to a tab that did not close');
+}
+
 async function main() {
   process.on('unhandledRejection', error => { console.error('UNHANDLED', error?.stack ?? error); process.exit(1); });
   console.log('phase: stage');
@@ -329,6 +431,8 @@ async function main() {
   await testRelay();
   console.log('phase: guard');
   await testGuard();
+  console.log('phase: leave prompt');
+  await testLeavePrompt();
   console.log('Playwright extension relay/stage/guard tests passed');
 }
 

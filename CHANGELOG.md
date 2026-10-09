@@ -2,6 +2,17 @@
 
 Versions are the extension's `manifest.json` version.
 
+## 0.5.4 (2026-10-09)
+
+- **"Leave site?" prompts no longer lock your keyboard.** When an agent leaves a page
+  with unsaved changes (a navigation, a tab close, or the end of its session), Chrome
+  asks "Leave site? Changes you made may not be saved." That prompt is a dialog
+  window that takes Chrome's keyboard, and on the hidden display nobody can see it:
+  your clicks in Chrome still work but your typing goes nowhere, and the agent's
+  navigation hangs until it times out. The extension now accepts these prompts on
+  agent tabs itself, while an agent is attached and when it closes an ended session's
+  tabs. Alerts, confirms, and text prompts still go to the agent.
+
 ## 0.5.3 (2026-10-04)
 
 - **Nothing else lands on Agent Lanes.** The display helper gains two guards behind

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Agent Lanes for Chrome",
-  "version": "0.5.3",
-  "version_name": "0.5.3 (Playwright extension 0.3.0 fork)",
+  "version": "0.5.4",
+  "version_name": "0.5.4 (Playwright extension 0.3.0 fork)",
   "description": "Lets many AI agents drive your logged-in Chrome in the background: shared normal-type, normal-state, non-focused lane windows, parked on an invisible agent display, host many input-capable agent tabs scheduled one at a time.",
   "permissions": [
     "debugger",

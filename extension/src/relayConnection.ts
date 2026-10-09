@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+import { acceptLeavePrompt, isLeavePrompt } from './leavePrompt';
+
 export function debugLog(...args: unknown[]): void {
   const enabled = true;
   if (enabled) {
@@ -87,6 +89,9 @@ export class RelayConnection {
   // asynchronous connection-close cleanup reads the window.
   private _workspaceReclaimed = false;
   private _ownedTabIds = new Set<number>();
+  // "Leave site?" prompts this relay accepted, as tabId:sessionId, so their
+  // matching close events are not forwarded either.
+  private _acceptedLeavePrompts = new Set<string>();
 
   onclose?: () => void;
   onownershipchange?: (ownedTabIds: number[]) => void;
@@ -236,6 +241,8 @@ export class RelayConnection {
     const tabId = this._tabIdForEventArgs(fullMethod, args);
     if (tabId === undefined || !this._attachedTabs.has(tabId))
       return;
+    if (fullMethod === 'chrome.debugger.onEvent' && this._answerLeavePrompt(tabId, args))
+      return;
     if (fullMethod === 'chrome.tabs.onCreated') {
       const tab = args[0] as chrome.tabs.Tab;
       // A popup inherits ownership only from an agent-owned opener. A user tab
@@ -311,6 +318,20 @@ export class RelayConnection {
       if (!this._attachedTabs.has(tabId))
         this._checkLastTabDetached();
     }, REATTACH_VERIFY_MS);
+  }
+
+  // Accepts an owned tab's "Leave site?" prompt (see leavePrompt.ts). Neither
+  // the prompt nor its close reaches the agent, whose navigation or tab close
+  // then simply goes ahead.
+  private _answerLeavePrompt(tabId: number, args: any[]): boolean {
+    const [source, method, params] = args as [chrome.debugger.Debuggee & { sessionId?: string }, string, any];
+    const key = `${tabId}:${source?.sessionId ?? ''}`;
+    if (isLeavePrompt(method, params) && this._ownedTabIds.has(tabId)) {
+      this._acceptedLeavePrompts.add(key);
+      void acceptLeavePrompt(source);
+      return true;
+    }
+    return method === 'Page.javascriptDialogClosed' && this._acceptedLeavePrompts.delete(key);
   }
 
   // Returns the tabId an event refers to, for filtering by _attachedTabs.

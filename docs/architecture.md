@@ -129,6 +129,20 @@ Two guards in `agent-lane-display`, behind one Accessibility grant:
   on. Chrome's windows are the extension's job, and the AutoFill popup beside a lane's
   login field stays with it. Overlays an app shows on every screen are left alone.
 
+## "Leave site?" prompts
+
+An agent leaves pages with unsaved changes all the time: a navigation, a tab close,
+the end of its session. Chrome answers each with "Leave site? Changes you made may not
+be saved.", a dialog window that takes Chrome's keyboard. On the hidden display nobody
+can see it, so your typing in Chrome goes nowhere and the agent's navigation hangs. The
+agent always means to leave, so the extension accepts the prompt itself
+(`extension/src/leavePrompt.ts`). While a relay is attached, it answers
+`Page.javascriptDialogOpening` of type `beforeunload` on an owned tab with
+`Page.handleJavaScriptDialog {accept: true}` and forwards neither the prompt nor its
+close, so the agent never sees it. Session cleanup closes tabs after the relay has
+detached, so it attaches the debugger to each tab for its close and answers the prompt
+there. Alerts, confirms, and text prompts still go to the agent.
+
 ## Refill and the fuse
 
 The launcher app runs a loop every second while Chrome is open. When the pool is

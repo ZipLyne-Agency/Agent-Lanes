@@ -15,6 +15,7 @@
  */
 
 import { RelayConnection, debugLog } from './relayConnection';
+import { closeAgentTabs } from './leavePrompt';
 import { isBackgroundedLaneWindow } from './workspaceLifecycle';
 
 const PLAYWRIGHT_GROUP_TITLE = 'Playwright';
@@ -259,8 +260,10 @@ export class ConnectedTabGroup {
       const managedIds = tabs
           .map(tab => tab.id)
           .filter((tabId): tabId is number => tabId !== undefined && tabId !== workspace.anchorTabId && owned.has(tabId));
+      // The relay has detached by now, so closeAgentTabs answers any "Leave
+      // site?" prompt a page with unsaved changes raises on its way out.
       if (managedIds.length)
-        await chrome.tabs.remove(managedIds);
+        await closeAgentTabs(managedIds);
       return true;
     } catch (error: any) {
       debugLog('Error cleaning up agent lane:', error);

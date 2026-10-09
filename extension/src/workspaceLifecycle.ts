@@ -18,6 +18,7 @@
 
 import { boundsWithin, findAgentDisplay, isWindowOnDisplay } from './agentDisplay';
 import { cleanupStalePlaywrightGroups } from './connectedTabGroup';
+import { closeAgentTabs } from './leavePrompt';
 import { debugLog } from './relayConnection';
 
 export const LANE_STORAGE_PREFIX = 'playwrightLane:';
@@ -126,7 +127,7 @@ async function recoverSessionRecord(key: string, value: unknown, browserSessionI
     // removed only while the lane is still an unfocused normal agent window
     // whose anchor is intact; anything else is user-reclaimed and preserved.
     if (isBackgroundedLaneWindow(window) && anchorPresent && owned.length)
-      await chrome.tabs.remove(owned);
+      await closeAgentTabs(owned);
   } catch {
     // Window gone: nothing to clean.
   }
